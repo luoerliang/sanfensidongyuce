@@ -23,11 +23,14 @@ DEFAULT_HISTORY_SOURCE = "https://sanfensidongyuce-2.onrender.com/api/history?li
 HISTORY_SOURCE_URL = os.getenv("HISTORY_SOURCE_URL", DEFAULT_HISTORY_SOURCE).strip()
 
 live_cache = {"issue": None, "data": None, "building": False}
+history_cache = {"total": 0, "items": [], "loaded_at": ""}
+history_cache_lock = threading.RLock()
+
 live_cache_lock = threading.Lock()
 sync_state = {"source": HISTORY_SOURCE_URL, "imported": 0, "last_error": "", "last_sync": ""}
 
 app = Flask(__name__)
-db_lock = threading.Lock()
+db_lock = threading.RLock()
 stats_cache = {"issue": None, "value": None}
 
 RED_NUMS = {1,2,7,8,12,13,18,19,23,24,29,30,34,35,40,45,46}
@@ -126,7 +129,7 @@ box-shadow:0 12px 30px #0007;opacity:0;pointer-events:none;transition:.2s;z-inde
     <div class="livebox"><span class="dot"></span><span>实时录入</span></div>
     <div style="text-align:right">
       <div class="title">三分彩 · 智能看板</div>
-      <div class="subtitle">TG自动入库 · 新开奖才重算 · 1秒读取缓存</div>
+      <div class="subtitle">TG自动入库 · WAL防锁 · 1秒读内存</div>
     </div>
   </div>
 
@@ -282,7 +285,7 @@ async function loadHistory(){
 loadMain(); loadStats(); loadHistory();
 setInterval(loadMain,1000);
 setInterval(loadStats,30000);
-setInterval(loadHistory,20000);
+setInterval(loadHistory,5000);
 </script>
 </body>
 </html>"""
@@ -293,13 +296,31 @@ def ensure_db_dir():
 
 def connect():
     ensure_db_dir()
-    c = sqlite3.connect(DB, timeout=30, check_same_thread=False)
+    c = sqlite3.connect(DB, timeout=20, check_same_thread=False)
     c.row_factory = sqlite3.Row
+    c.execute("PRAGMA busy_timeout=20000")
+    c.execute("PRAGMA synchronous=NORMAL")
+    c.execute("PRAGMA temp_store=MEMORY")
     return c
+
+def _db_retry(fn, attempts=8):
+    last=None
+    for i in range(attempts):
+        try:
+            return fn()
+        except sqlite3.OperationalError as e:
+            last=e
+            if "locked" not in str(e).lower() and "busy" not in str(e).lower():
+                raise
+            time.sleep(min(0.08*(2**i),1.2))
+    raise last
 
 def init_db():
     with db_lock:
         c=connect()
+        # WAL lets readers continue while Telegram writes the next draw.
+        _db_retry(lambda: c.execute("PRAGMA journal_mode=WAL").fetchone())
+        c.execute("PRAGMA wal_autocheckpoint=800")
         c.execute("""CREATE TABLE IF NOT EXISTS draws(
           issue TEXT PRIMARY KEY,
           n1 INTEGER,n2 INTEGER,n3 INTEGER,n4 INTEGER,n5 INTEGER,n6 INTEGER,special INTEGER,
@@ -412,24 +433,36 @@ def sync_remote_history(url=None):
         return 0
 
 def sync_best_available_history():
-    """Prefer a full export when the source supports it; fall back to the URL user supplied."""
+    """Migrate from the deployment that is live right now, then configured fallbacks.
+    On Render zero-downtime deploys, our public URL normally still serves the old
+    deployment while this new worker is booting. This keeps bot-collected history
+    across v13 -> v14 and later same-service upgrades."""
     urls=[]
+
+    # Best source: this service's currently-live previous deployment.
+    if WEBHOOK_BASE_URL:
+        urls += [
+          WEBHOOK_BASE_URL + "/api/export?limit=30000",
+          WEBHOOK_BASE_URL + "/api/history?limit=500"
+        ]
+
+    # Configured explicit fallback/source.
     if HISTORY_SOURCE_URL:
-        # If source is an old /api/history URL, try it exactly.
-        urls.append(HISTORY_SOURCE_URL)
-        # If it has a service base, also try the future full export endpoint.
         if "/api/" in HISTORY_SOURCE_URL:
             base=HISTORY_SOURCE_URL.split("/api/",1)[0]
-            urls.insert(0,base+"/api/export?limit=20000")
+            urls += [base+"/api/export?limit=30000"]
+        urls += [HISTORY_SOURCE_URL]
+
     seen=set()
     total=0
     for u in urls:
-        if u in seen: continue
+        if not u or u in seen:
+            continue
         seen.add(u)
         n=sync_remote_history(u)
-        total+=n
-        # A successful response with imported 0 may simply mean everything is already present.
+        total += n
         if not sync_state["last_error"]:
+            # Success includes 0 imported (everything already present).
             break
     return total
 
@@ -469,14 +502,52 @@ def add_draw(issue,nums,zs,colors,raw):
             with live_cache_lock:
                 live_cache["issue"]=None
                 live_cache["data"]=None
-            threading.Thread(target=rebuild_live_cache,daemon=True,name="model-rebuild").start()
+            threading.Thread(target=refresh_all_caches,daemon=True,name="cache-refresh").start()
         return changed
 
 def all_rows():
-    c=connect()
-    r=c.execute("SELECT * FROM draws ORDER BY CAST(issue AS INTEGER) DESC").fetchall()
-    c.close()
-    return r
+    def _read():
+        c=connect()
+        try:
+            return c.execute("SELECT * FROM draws ORDER BY CAST(issue AS INTEGER) DESC").fetchall()
+        finally:
+            c.close()
+    return _db_retry(_read)
+
+def refresh_history_cache(limit=500):
+    def _read():
+        c=connect()
+        try:
+            total=c.execute("SELECT COUNT(*) FROM draws").fetchone()[0]
+            rr=c.execute("""SELECT issue,n1,n2,n3,n4,n5,n6,special,z7,created_at
+                            FROM draws ORDER BY CAST(issue AS INTEGER) DESC LIMIT ?""",(limit,)).fetchall()
+            return total,rr
+        finally:
+            c.close()
+    total,rr=_db_retry(_read)
+    items=[]
+    for x in rr:
+        items.append({
+          "issue":x["issue"],
+          "numbers":[x[f"n{i}"] for i in range(1,7)]+[x["special"]],
+          "zodiac":normalize_z(x["z7"] or ""),
+          "created_at":x["created_at"] or ""
+        })
+    with history_cache_lock:
+        history_cache["total"]=total
+        history_cache["items"]=items
+        history_cache["loaded_at"]=time.strftime("%Y-%m-%d %H:%M:%S")
+    return total
+
+def refresh_all_caches():
+    try:
+        rebuild_live_cache()
+    except Exception as e:
+        print(f"[CACHE] model refresh failed: {type(e).__name__}: {e}",flush=True)
+    try:
+        refresh_history_cache()
+    except Exception as e:
+        print(f"[CACHE] history refresh failed: {type(e).__name__}: {e}",flush=True)
 
 def exp_weight(i,half_life):
     return 0.5 ** (i/max(half_life,1))
@@ -828,7 +899,9 @@ def home():
 
 @app.get("/api/health")
 def health():
-    return jsonify({"ok":True,"db":DB,"telegram":bool(BOT_TOKEN),"telegram_mode":"webhook","webhook_base":WEBHOOK_BASE_URL,"count":len(all_rows())})
+    with history_cache_lock:
+        count=history_cache.get("total",0)
+    return jsonify({"ok":True,"db":DB,"sqlite_mode":"WAL","telegram":bool(BOT_TOKEN),"telegram_mode":"webhook","webhook_base":WEBHOOK_BASE_URL,"count":count})
 
 @app.get("/api/prediction")
 def prediction():
@@ -843,22 +916,27 @@ def stats_api():
 
 @app.get("/api/history")
 def history():
-    try: limit=max(20,min(int(request.args.get("limit","200")),20000))
-    except Exception: limit=200
-    c=connect()
-    total=c.execute("SELECT COUNT(*) FROM draws").fetchone()[0]
-    rr=c.execute("""SELECT issue,n1,n2,n3,n4,n5,n6,special,z7,created_at
-                    FROM draws ORDER BY CAST(issue AS INTEGER) DESC LIMIT ?""",(limit,)).fetchall()
-    c.close()
-    items=[]
-    for x in rr:
-        items.append({
-          "issue":x["issue"],
-          "numbers":[x[f"n{i}"] for i in range(1,7)]+[x["special"]],
-          "zodiac":normalize_z(x["z7"] or ""),
-          "created_at":x["created_at"] or ""
-        })
-    return jsonify({"total":total,"items":items})
+    try:
+        limit=max(20,min(int(request.args.get("limit","200")),500))
+    except Exception:
+        limit=200
+    with history_cache_lock:
+        total=history_cache.get("total",0)
+        items=list(history_cache.get("items",[]))[:limit]
+        loaded_at=history_cache.get("loaded_at","")
+    # If cache is unexpectedly empty, rebuild once.
+    if not items:
+        try:
+            refresh_history_cache()
+            with history_cache_lock:
+                total=history_cache.get("total",0)
+                items=list(history_cache.get("items",[]))[:limit]
+                loaded_at=history_cache.get("loaded_at","")
+        except Exception as e:
+            return jsonify({"total":0,"items":[],"error":str(e)}),503
+    resp=jsonify({"total":total,"items":items,"cache_time":loaded_at})
+    resp.headers["Cache-Control"]="no-store, no-cache, must-revalidate, max-age=0"
+    return resp
 
 @app.get("/api/export")
 def export_history():
@@ -866,26 +944,31 @@ def export_history():
         limit=max(20,min(int(request.args.get("limit","20000")),30000))
     except Exception:
         limit=20000
-    c=connect()
-    rr=c.execute("""SELECT * FROM draws
-                    ORDER BY CAST(issue AS INTEGER) DESC LIMIT ?""",(limit,)).fetchall()
-    total=c.execute("SELECT COUNT(*) FROM draws").fetchone()[0]
-    c.close()
-    items=[]
-    for x in rr:
-        items.append({k:x[k] for k in x.keys()})
+    def _read():
+        c=connect()
+        try:
+            rr=c.execute("""SELECT * FROM draws
+                            ORDER BY CAST(issue AS INTEGER) DESC LIMIT ?""",(limit,)).fetchall()
+            total=c.execute("SELECT COUNT(*) FROM draws").fetchone()[0]
+            return total,rr
+        finally:
+            c.close()
+    total,rr=_db_retry(_read)
+    items=[{k:x[k] for k in x.keys()} for x in rr]
     return jsonify({"total":total,"items":items})
 
 @app.get("/api/sync-status")
 def sync_status():
-    return jsonify({**sync_state,"history_count":len(all_rows())})
+    with history_cache_lock:
+        count=history_cache.get("total",0)
+    return jsonify({**sync_state,"history_count":count})
 
 @app.post("/api/sync-history")
 def sync_history_now():
     body=request.get_json(silent=True) or {}
     url=str(body.get("url") or HISTORY_SOURCE_URL or "").strip()
     n=sync_remote_history(url)
-    rebuild_live_cache()
+    refresh_all_caches()
     return jsonify({"ok":not bool(sync_state["last_error"]),"imported":n,**sync_state})
 
 
@@ -1010,8 +1093,8 @@ def boot():
     # before this new version becomes the active deployment.
     sync_best_available_history()
 
-    # Build once; page refreshes then read this cache in milliseconds.
-    rebuild_live_cache()
+    # Build once; page refreshes then read memory only.
+    refresh_all_caches()
 
     if BOT_TOKEN:
         threading.Thread(target=webhook_keeper,daemon=True,name="telegram-webhook-keeper").start()

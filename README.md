@@ -1,58 +1,48 @@
-# 三分六合彩 极速续存版 v13
+# 三分六合彩 极速稳定版 v14
 
-这版专门解决两个问题：
+修复截图中的：
+`sqlite3.OperationalError: database is locked`
 
-## 1. 网页刷新慢
-以前 `/api/prediction` 每次刷新都可能重新扫一万多期。
-v13 改成：
-- 启动时只算一次
-- 每收到一个新期开奖才重算一次
-- 结果放在内存缓存
-- 网页每 1 秒只读取缓存
+## v14 数据库修复
+- SQLite 改为 WAL 模式
+- busy_timeout = 20秒
+- 数据库 busy/locked 自动指数重试
+- Telegram 写入时，网页读取不再互相阻塞
+- `/api/history` 改为直接读内存缓存，不再每5/20秒碰 SQLite
+- 模型结果也继续读内存缓存
+- 收到新开奖：先写一条 -> commit -> 后台重算模型和历史缓存
 
-所以页面刷新不再每次重新跑模型。
+## 页面速度
+- 主模型：每1秒读取内存缓存
+- 历史：每5秒读取内存缓存
+- 只有出现新期开奖才重新计算模型
+- 回测仍独立低频刷新，不拖慢主页面
 
-## 2. 新版本要带上机器人后来收录的历史
-v13 已内置你当前旧服务历史地址：
+## 换版本历史自动续存
+v14 新增更稳的“同服务迁移”：
+Render 部署新版本时，新 worker 启动阶段会优先访问当前服务自己的公网 URL。
+在零停机部署切换前，该 URL 通常仍由上一版本提供，因此 v14 会先拉：
+1. `/api/export?limit=30000`
+2. 失败才回退 `/api/history?limit=500`
 
-`https://sanfensidongyuce-2.onrender.com/api/history?limit=500`
+然后再开始新版本。
 
-新服务启动时自动：
-1. 导入 ZIP 里的原始 14343 期
-2. 从旧服务抓取机器人后来收录的最近 500 期
-3. 按期号去重合并
-4. 再开始新版本的 Telegram Webhook
+还保留 HISTORY_SOURCE_URL 作为备用历史源。
 
-从 v13 开始又增加：
-- `/api/export?limit=20000`：完整历史导出（含全部生肖/颜色/raw）
-- `/api/sync-status`：查看同步状态
-- `/api/sync-history`：手动同步
+这意味着以后 v14 -> v15 在同一个 Render 服务覆盖部署时，程序会先尽量把上一版机器人已收录历史迁入新实例。
 
-这样下一版可以直接从 v13 的完整 `/api/export` 迁移，不必再回到最初 CSV。
+## 重要
+Render 免费 Web Service 的 SQLite 仍是临时文件系统。
+“部署时自动迁移”解决的是换版本续存，不等同于永久数据库。
+如果服务被平台彻底重建且旧实例已不可访问，真正不丢数据仍应使用 PostgreSQL 或 Persistent Disk。
 
-## 最稳的部署方法（重要）
-为了确保“旧服务”在新版本启动时还能提供历史数据：
-- 不要直接覆盖 `sanfensidongyuce-2`
-- 用 v13 新建一个 Render Web Service（例如 `sanfensidongyuce-3`）
-- 环境变量照旧：
-  - BOT_TOKEN
-  - ALLOWED_CHAT_ID=-5560268424
-  - DB_PATH=history.db
-  - HISTORY_SOURCE_URL=https://sanfensidongyuce-2.onrender.com/api/history?limit=500
-- 新服务显示历史总数和最新期号正确后，再暂停旧服务
-
-## 长期真正不丢历史
-Render 免费 Web Service 的本地 SQLite 不是永久存储。
-v13 的“自动从上一版本迁移”可以让换版本时保留数据，但它不是数据库级永久保障。
-要做到服务重启/换机器也绝不丢，最终应使用持久磁盘或 PostgreSQL。
-
-其余功能全部保留：
-- 波色/生肖/大小/单双走势特征
+其他功能全部保留：
+- Webhook TG接收
+- 波色/生肖/大小/单双趋势
 - 自适应22码
 - 4肖对应每肖1~3码
-- 22码一键复制
+- 一键复制
 - 最新开奖结果
 - 红蓝绿颜色
-- 回测命中率/错误率
+- 命中率/错误率
 - 底部历史滚动
-- Webhook稳定接收
