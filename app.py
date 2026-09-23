@@ -23,6 +23,14 @@ DEFAULT_HISTORY_SOURCE = "https://sanfensidongyuce-2.onrender.com/api/history?li
 HISTORY_SOURCE_URL = os.getenv("HISTORY_SOURCE_URL", DEFAULT_HISTORY_SOURCE).strip()
 
 live_cache = {"issue": None, "data": None, "building": False}
+model_state = {
+    "profile": None,
+    "profile_scores": {},
+    "last_calibrated_issue": None,
+    "recalc_started_at": "",
+    "recalc_finished_at": ""
+}
+
 history_cache = {"total": 0, "items": [], "loaded_at": ""}
 history_cache_lock = threading.RLock()
 
@@ -130,7 +138,7 @@ box-shadow:0 12px 30px #0007;opacity:0;pointer-events:none;transition:.2s;z-inde
     <div class="livebox"><span class="dot"></span><span>实时录入</span></div>
     <div style="text-align:right">
       <div class="title">三分彩 · 智能看板</div>
-      <div class="subtitle">TG自动入库 · WAL防锁 · 1秒读内存</div>
+      <div class="subtitle">TG自动入库 · 开奖先秒显 · 模型后台重算</div>
     </div>
   </div>
 
@@ -151,7 +159,7 @@ box-shadow:0 12px 30px #0007;opacity:0;pointer-events:none;transition:.2s;z-inde
     <div class="pillrow">
       <span id="latestZodiac" class="pill"></span>
       <span id="lastIngest" class="pill ok"></span>
-      <span id="tg" class="pill ok"></span><span id="adaptiveInfo" class="pill"></span>
+      <span id="tg" class="pill ok"></span><span id="adaptiveInfo" class="pill"></span><span id="calcState" class="pill"></span>
     </div>
   </section>
 
@@ -274,6 +282,8 @@ async function loadMain(){
     lastIngest.textContent=d.latest_created_at?`最后录入 ${d.latest_created_at}`:'实时录入';
     tg.textContent=d.telegram?'Telegram 已连接':'Telegram 未配置';
     adaptiveInfo.textContent=`自动校准：${d.profile||'--'} · 24码按12肖分层`;
+    calcState.textContent=d.recalculating?'新期开奖已入库 · 模型重算中':'模型已更新';
+    calcState.className=d.recalculating?'pill':'pill ok';
 
   }catch(e){}
 }
@@ -299,7 +309,7 @@ async function loadHistory(){
   }catch(e){}
 }
 loadMain(); loadStats(); loadHistory();
-setInterval(loadMain,1000);
+setInterval(loadMain,500);
 setInterval(loadStats,30000);
 setInterval(loadHistory,5000);
 </script>
@@ -500,6 +510,36 @@ def parse_draw(text):
     colors=colors[-7:] if len(colors)>=7 else [""]*7
     return issue,nums,zs,colors
 
+def latest_row():
+    def _read():
+        c=connect()
+        try:
+            return c.execute("""SELECT * FROM draws
+                                ORDER BY CAST(issue AS INTEGER) DESC LIMIT 1""").fetchone()
+        finally:
+            c.close()
+    return _db_retry(_read)
+
+def _patch_live_cache_latest(issue, nums, zs):
+    """Update visible latest result immediately, without waiting for the heavy model."""
+    with live_cache_lock:
+        data = dict(live_cache.get("data") or {})
+        try:
+            next_issue = str(int(issue) + 1)
+        except Exception:
+            next_issue = ""
+        data.update({
+            "issue": issue,
+            "next_issue": next_issue,
+            "latest_numbers": list(nums),
+            "latest_special_zodiac": normalize_z(zs[6] if len(zs) >= 7 else ""),
+            "latest_created_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "recalculating": True
+        })
+        live_cache["issue"] = issue
+        live_cache["data"] = data
+        live_cache["building"] = False
+
 def add_draw(issue,nums,zs,colors,raw):
     if len(nums)!=7 or len(set(nums))!=7 or not all(1<=x<=49 for x in nums): return False
     with db_lock:
@@ -515,9 +555,7 @@ def add_draw(issue,nums,zs,colors,raw):
         if changed:
             stats_cache["issue"]=None
             stats_cache["value"]=None
-            with live_cache_lock:
-                live_cache["issue"]=None
-                live_cache["data"]=None
+            _patch_live_cache_latest(issue, nums, zs)
             threading.Thread(target=refresh_all_caches,daemon=True,name="cache-refresh").start()
         return changed
 
@@ -557,13 +595,13 @@ def refresh_history_cache(limit=500):
 
 def refresh_all_caches():
     try:
-        rebuild_live_cache()
-    except Exception as e:
-        print(f"[CACHE] model refresh failed: {type(e).__name__}: {e}",flush=True)
-    try:
         refresh_history_cache()
     except Exception as e:
         print(f"[CACHE] history refresh failed: {type(e).__name__}: {e}",flush=True)
+    try:
+        rebuild_live_cache()
+    except Exception as e:
+        print(f"[CACHE] model refresh failed: {type(e).__name__}: {e}",flush=True)
 
 def exp_weight(i,half_life):
     return 0.5 ** (i/max(half_life,1))
@@ -796,10 +834,28 @@ def _profile_score_on_recent(r, profile, samples=28):
     # Coverage is the main objective, but 4肖/一肖一码 matter too.
     return (.58*h24 + .17*hmain + .25*hz)/n
 
-def _select_profile(r):
-    scores={name:_profile_score_on_recent(r,name,28) for name in PROFILE_LIBRARY}
+def _select_profile(r, force=False):
+    latest_issue = r[0]["issue"] if r else None
+    cached = model_state.get("profile")
+    last = model_state.get("last_calibrated_issue")
+
+    # Recalibrate every 12 issues or when no cached profile exists.
+    should_recalibrate = force or not cached or not last
+    if not should_recalibrate and latest_issue and last:
+        try:
+            should_recalibrate = abs(int(latest_issue) - int(last)) >= 12
+        except Exception:
+            should_recalibrate = False
+
+    if not should_recalibrate:
+        return cached, dict(model_state.get("profile_scores") or {})
+
+    scores={name:_profile_score_on_recent(r,name,20) for name in PROFILE_LIBRARY}
     best=max(scores,key=lambda k:(scores[k],k))
-    return best,{k:round(v*100,1) for k,v in scores.items()}
+    model_state["profile"]=best
+    model_state["profile_scores"]={k:round(v*100,1) for k,v in scores.items()}
+    model_state["last_calibrated_issue"]=latest_issue
+    return best, dict(model_state["profile_scores"])
 
 def predict_core(r, profile=None):
     if not r:return [],[],[]
@@ -847,9 +903,10 @@ def backtest_stats(r, sample=60):
     return val
 
 def build_model():
+    model_state["recalc_started_at"]=time.strftime("%Y-%m-%d %H:%M:%S")
     r=all_rows()
     if not r:
-        return {"issue":None,"count":0,"special24":[],"main4":[],"zodiac4":[],"zodiac_groups":[],"zodiac_pairs":[],"telegram":bool(BOT_TOKEN)}
+        return {"issue":None,"count":0,"special24":[],"main4":[],"zodiac4":[],"zodiac_groups":[],"zodiac_pairs":[],"telegram":bool(BOT_TOKEN),"recalculating":False}
     profile,profile_scores=_select_profile(r)
     c24,m4,z4,groups,zpairs=_predict_with_profile(r,profile)
     trend=_trend_profiles(r)
@@ -874,7 +931,10 @@ def build_model():
         "size":{k:round(v*100,1) for k,v in trend["size"].items()},
         "parity":{k:round(v*100,1) for k,v in trend["parity"].items()}
       },
-      "telegram":bool(BOT_TOKEN)
+      "telegram":bool(BOT_TOKEN),
+      "recalculating":False,
+      "model_recalc_started_at":model_state.get("recalc_started_at",""),
+      "model_recalc_finished_at":time.strftime("%Y-%m-%d %H:%M:%S")
     }
 
 def rebuild_live_cache():
@@ -882,23 +942,34 @@ def rebuild_live_cache():
         if live_cache.get("building"):
             return live_cache.get("data")
         live_cache["building"]=True
+        previous=live_cache.get("data")
+    t0=time.time()
     try:
         data=build_model()
+        model_state["recalc_finished_at"]=time.strftime("%Y-%m-%d %H:%M:%S")
         with live_cache_lock:
             live_cache["data"]=data
             live_cache["issue"]=data.get("issue") if isinstance(data,dict) else None
+        print(f"[CACHE] model rebuilt issue={data.get('issue')} in {time.time()-t0:.2f}s",flush=True)
         return data
+    except Exception as e:
+        print(f"[CACHE] model rebuild failed: {type(e).__name__}: {e}",flush=True)
+        return previous
     finally:
         with live_cache_lock:
             live_cache["building"]=False
 
 def model():
-    """Fast path for the web page: normally returns the already-built result."""
+    """Always return the current memory snapshot immediately."""
     with live_cache_lock:
         data=live_cache.get("data")
+        building=live_cache.get("building")
     if data is not None:
         return data
-    return rebuild_live_cache() or build_model()
+    if not building:
+        # First boot only. Build synchronously once.
+        return rebuild_live_cache() or {"issue":None,"count":0,"recalculating":True}
+    return {"issue":None,"count":0,"recalculating":True}
 
 
 @app.get("/")
