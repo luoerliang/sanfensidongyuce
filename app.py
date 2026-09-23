@@ -88,6 +88,16 @@ ai_state = {
     "updated_at": ""
 }
 
+auto_state = {
+    "last_draw_issue": "",
+    "last_prediction_issue": "",
+    "last_learning_issue": "",
+    "last_stats_issue": "",
+    "last_refresh_at": "",
+    "last_error": "",
+    "updating": False
+}
+
 
 RED_NUMS = {1,2,7,8,12,13,18,19,23,24,29,30,34,35,40,45,46}
 BLUE_NUMS = {3,4,9,10,14,15,20,25,26,31,36,37,41,42,47,48}
@@ -374,8 +384,9 @@ async function loadMain(){
     forecastMode.innerHTML=`${fc.mode||'前瞻预测'}<br>转移样本 ${fc.transition_samples??0} · 全历史 ${fc.long_prior_ready?'已缓存':'后台加载'}`;
     const lr=d.learning||{};
     const ail=lr.ai_live||{};
-    learningState.innerHTML=`AI训练 ${lr.ai_trained??0} 次 · 融合 ${lr.ai_mix_pct??0}%<br>AI实盘24码 ${ail.hit24??0}% (${ail.n??0}/60)`;
-    learningProgress.innerHTML=`模型结算 ${lr.settled??0}/60 期<br>历史AI验证 ${lr.ai_history_hit24??0}% / ${lr.ai_history_n??0}期`;
+    const au=lr.auto||{};
+    learningState.innerHTML=`AI累计更新 ${lr.ai_trained??0} 次（自动）<br>AI融合 ${lr.ai_mix_pct??0}% · 实盘24码 ${ail.hit24??0}% (${ail.n??0}/60)`;
+    learningProgress.innerHTML=`模型结算 ${lr.settled??0}/60 期 · ${au.updating?'正在自动更新':'已自动更新'}<br>下一期 ${au.last_prediction_issue||d.next_issue||'--'} · ${au.last_error?'异常':'正常'}`;
     const sg=d.strategy||{};
     coldSignal.innerHTML=sg.cold_rebound_now?'冷反弹信号：启用<br>24码允许热+冷防守':'冷反弹信号：普通<br>仍以热码为主';
     coldZodiac.innerHTML=(sg.cold_zodiacs||[]).length?`偏冷：${sg.cold_zodiacs.join('、')}`:'暂无';
@@ -408,6 +419,15 @@ async function loadStats(){
     }
   }catch(e){}
 }
+async function loadAutoStatus(){
+  try{
+    const r=await fetch('/api/auto-status?_='+Date.now(),{cache:'no-store'});
+    const a=await r.json();
+    const n=a.ai_live||{};
+    learningState.innerHTML=`AI累计更新 ${a.ai_trained??0} 次（自动）<br>AI融合 ${a.ai_mix_pct??0}% · 实盘24码 ${n.hit24??0}% (${n.n??0}/60)`;
+    learningProgress.innerHTML=`模型结算 ${a.model_settled??0}/60 期 · ${a.updating?'正在自动更新':'已自动更新'}<br>下一期 ${a.last_prediction_issue||'--'} · ${a.last_error?'异常':'正常'}`;
+  }catch(e){}
+}
 async function loadHistory(){
   try{
     const r=await fetch('/api/history?limit=200&_='+Date.now(),{cache:'no-store'});
@@ -420,9 +440,10 @@ async function loadHistory(){
       </div>`).join('');
   }catch(e){}
 }
-loadMain(); loadStats(); loadHistory();
+loadMain(); loadStats(); loadAutoStatus(); loadHistory();
 setInterval(loadMain,500);
-setInterval(loadStats,30000);
+setInterval(loadAutoStatus,1000);
+setInterval(loadStats,10000);
 setInterval(loadHistory,5000);
 </script>
 </body>
@@ -697,6 +718,53 @@ def _patch_live_cache_latest(issue, nums, zs):
         live_cache["data"] = data
         live_cache["building"] = False
 
+
+def _refresh_learning_and_stats():
+    """Refresh all derived learning/status values after AI/model work."""
+    try:
+        refresh_learner_cache(60)
+        auto_state["last_stats_issue"]=str(learner_cache.get("settled",0))
+    except Exception as e:
+        auto_state["last_error"]=f"learner refresh: {e}"
+
+def _auto_update_after_draw(issue, nums):
+    """One unified post-draw pipeline. Nothing here requires a manual browser refresh."""
+    auto_state["updating"]=True
+    auto_state["last_draw_issue"]=str(issue)
+    auto_state["last_error"]=""
+    try:
+        # 1) Train AI on the just-finished issue.
+        train_ai_after_new_draw(issue, nums)
+        auto_state["last_learning_issue"]=str(issue)
+
+        # 2) Rebuild the live forecast for the NEXT issue.
+        refresh_all_caches()
+
+        # 3) Refresh learner/60-issue stats.
+        _refresh_learning_and_stats()
+
+        # 4) Record next-issue shadow predictions if cache rebuild did not already do it.
+        try:
+            rr=recent_rows(1200)
+            if rr:
+                auto_state["last_prediction_issue"]=str(int(rr[0]["issue"])+1)
+        except Exception:
+            pass
+
+        auto_state["last_refresh_at"]=time.strftime("%Y-%m-%d %H:%M:%S")
+        print(
+            f"[AUTO] draw={auto_state['last_draw_issue']} "
+            f"learned={auto_state['last_learning_issue']} "
+            f"next={auto_state['last_prediction_issue']} "
+            f"at={auto_state['last_refresh_at']}",
+            flush=True
+        )
+    except Exception as e:
+        auto_state["last_error"]=f"{type(e).__name__}: {e}"
+        print(f"[AUTO] failed issue={issue}: {auto_state['last_error']}",flush=True)
+    finally:
+        auto_state["updating"]=False
+
 def add_draw(issue,nums,zs,colors,raw):
     if len(nums)!=7 or len(set(nums))!=7 or not all(1<=x<=49 for x in nums): return False
     prev_before_insert=latest_row()
@@ -716,10 +784,12 @@ def add_draw(issue,nums,zs,colors,raw):
             stats_cache["issue"]=None
             stats_cache["value"]=None
             _patch_live_cache_latest(issue, nums, zs)
-            def _learn_then_refresh():
-                train_ai_after_new_draw(issue, nums)
-                refresh_all_caches()
-            threading.Thread(target=_learn_then_refresh,daemon=True,name="ai-learn-and-refresh").start()
+            threading.Thread(
+                target=_auto_update_after_draw,
+                args=(issue, nums),
+                daemon=True,
+                name="auto-update-after-draw"
+            ).start()
         return changed
 
 def all_rows():
@@ -2376,11 +2446,22 @@ def build_model():
         "rate24":(learner_cache.get("profiles",{}).get(learner_cache.get("best_profile","平衡"),{}) or {}).get("rate24",0.0),
         "ai_trained":ai_state.get("trained",0),
         "ai_ready":ai_state.get("ready",False),
-        "ai_mix_pct":transition_meta.get("ai_mix_pct",0.0),
+        "ai_mix_pct":(
+            round((0.18+0.32*min(1.0,float(ai_state.get("trained",0))/60.0))*100,1)
+            if ai_state.get("ready",False) else 0.0
+        ),
         "ai_history_n":ai_state.get("historical_validation_n",0),
         "ai_history_hit24":ai_state.get("historical_hit24",0.0),
         "ai_live":ai_live_validation_stats(60),
-        "updated_at":learner_cache.get("updated_at","")
+        "updated_at":learner_cache.get("updated_at",""),
+        "auto":{
+            "updating":auto_state.get("updating",False),
+            "last_draw_issue":auto_state.get("last_draw_issue",""),
+            "last_learning_issue":auto_state.get("last_learning_issue",""),
+            "last_prediction_issue":auto_state.get("last_prediction_issue",""),
+            "last_refresh_at":auto_state.get("last_refresh_at",""),
+            "last_error":auto_state.get("last_error","")
+        }
       },
       "forecast":{
         "target_issue":next_issue,
@@ -2520,6 +2601,31 @@ def learning_export():
         limit=1000
     return jsonify(export_learning_payload(limit))
 
+
+@app.get("/api/auto-status")
+def auto_status():
+    with learner_lock:
+        best=learner_cache.get("best_profile","平衡")
+        settled=int(learner_cache.get("settled",0))
+        profiles=dict(learner_cache.get("profiles",{}) or {})
+    live=ai_live_validation_stats(60)
+    trained=int(ai_state.get("trained",0))
+    mix=round((0.18+0.32*min(1.0,trained/60.0))*100,1) if ai_state.get("ready",False) else 0.0
+    return jsonify({
+      "ok":True,
+      "updating":bool(auto_state.get("updating",False)),
+      "last_draw_issue":auto_state.get("last_draw_issue",""),
+      "last_learning_issue":auto_state.get("last_learning_issue",""),
+      "last_prediction_issue":auto_state.get("last_prediction_issue",""),
+      "last_refresh_at":auto_state.get("last_refresh_at",""),
+      "last_error":auto_state.get("last_error",""),
+      "ai_trained":trained,
+      "ai_mix_pct":mix,
+      "ai_live":live,
+      "model_settled":settled,
+      "model_best":best,
+      "model_rate24":(profiles.get(best,{}) or {}).get("rate24",0.0)
+    })
 
 @app.get("/api/history")
 def history():
@@ -2703,6 +2809,14 @@ def boot():
     sync_previous_learning()
     load_ai_state()
     refresh_learner_cache(60)
+    try:
+        _r0=recent_rows(1)
+        if _r0:
+            auto_state["last_draw_issue"]=str(_r0[0]["issue"])
+            auto_state["last_prediction_issue"]=str(int(_r0[0]["issue"])+1)
+    except Exception:
+        pass
+    auto_state["last_refresh_at"]=time.strftime("%Y-%m-%d %H:%M:%S")
 
     # Make the site usable immediately. Do NOT wait for model/backtest here.
     try:
