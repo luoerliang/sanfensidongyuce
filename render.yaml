@@ -1,6 +1,6 @@
 services:
   - type: web
-    name: sanfen-dashboard-v7
+    name: sanfen-webhook-v10
     runtime: docker
     envVars:
       - key: BOT_TOKEN
