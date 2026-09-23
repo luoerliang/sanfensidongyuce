@@ -36,6 +36,7 @@ stats_cache = {"issue": None, "value": None}
 RED_NUMS = {1,2,7,8,12,13,18,19,23,24,29,30,34,35,40,45,46}
 BLUE_NUMS = {3,4,9,10,14,15,20,25,26,31,36,37,41,42,47,48}
 GREEN_NUMS = {5,6,11,16,17,21,22,27,28,32,33,38,39,43,44,49}
+ALL_ZODIACS = ["鼠","牛","虎","兔","龙","蛇","马","羊","猴","鸡","狗","猪"]
 
 INDEX_HTML = """<!doctype html>
 <html lang="zh-CN">
@@ -157,26 +158,34 @@ box-shadow:0 12px 30px #0007;opacity:0;pointer-events:none;transition:.2s;z-inde
   <section class="card">
     <div class="sectionHead">
       <div>
-        <div class="sectionTitle">22个动态特码</div>
+        <div class="sectionTitle">24个动态特码</div>
         <div class="sectionHint">每期重算 · 升序</div>
       </div>
       <button class="copyBtn" onclick="copySpecial()">一键复制</button>
     </div>
     <div id="sp" class="balls"></div>
     <div class="pillrow" style="margin-top:10px">
-      <span class="pill">短期10/20/50期</span>
+      <span class="pill">12肖分层覆盖</span>
       <span class="pill">趋势加速度</span>
-      <span class="pill">临界位动态换码</span>
-      <span class="pill">不随机硬换</span>
+      <span class="pill">每肖1–3码</span>
+      <span class="pill">自动校准模型</span>
     </div>
   </section>
 
   <section class="card">
     <div class="sectionHead">
-      <div class="sectionTitle">4肖 · 对应候选码</div>
-      <div class="sectionHint">每肖1–3码 · 近期出现率优先</div>
+      <div class="sectionTitle">4肖 · 一肖一码</div>
+      <div class="sectionHint">4肖与4个主码严格一一对应</div>
     </div>
     <div id="zpair" class="zpairGrid"></div>
+  </section>
+
+  <section class="card">
+    <div class="sectionHead">
+      <div class="sectionTitle">24码 · 12肖分配</div>
+      <div class="sectionHint">每肖1–3个近期综合分最高码</div>
+    </div>
+    <div id="zgroups" class="zpairGrid"></div>
   </section>
 
   <section class="card">
@@ -189,13 +198,14 @@ box-shadow:0 12px 30px #0007;opacity:0;pointer-events:none;transition:.2s;z-inde
       <div class="trendBox"><div class="trendTitle">大小指数</div><div id="sizeTrend" class="trendMain">--</div></div>
       <div class="trendBox"><div class="trendTitle">单双走势</div><div id="parityTrend" class="trendMain">--</div></div>
     </div>
+    <div class="pillrow"><span id="profileInfo" class="pill"></span></div>
   </section>
 
   <section class="card">
     <div class="sectionHead"><div class="sectionTitle">近60期滚动回测</div><div class="sectionHint">命中 / 错误</div></div>
     <div class="stats">
-      <div class="stat"><div class="statName">22码</div><div id="hit22" class="rate">--</div><div id="err22" class="err"></div></div>
-      <div class="stat"><div class="statName">4主码</div><div id="hit4" class="rate">--</div><div id="err4" class="err"></div></div>
+      <div class="stat"><div class="statName">24码</div><div id="hit22" class="rate">--</div><div id="err22" class="err"></div></div>
+      <div class="stat"><div class="statName">4肖1码</div><div id="hit4" class="rate">--</div><div id="err4" class="err"></div></div>
       <div class="stat"><div class="statName">4肖</div><div id="hitZ" class="rate">--</div><div id="errZ" class="err"></div></div>
     </div>
   </section>
@@ -209,17 +219,17 @@ box-shadow:0 12px 30px #0007;opacity:0;pointer-events:none;transition:.2s;z-inde
   </section>
 
   <div id="toast" class="toast">已复制</div>
-  <div class="foot">号码颜色按红 / 蓝 / 绿波显示。新版把波色、生肖、大小、单双作为近期统计特征参与动态评分；命中率是历史滚动回测，不代表未来中奖概率。</div>
+  <div class="foot">号码颜色按红 / 蓝 / 绿波显示。新版把波色、生肖、大小、单双作为近期统计特征参与动态评分；命中率使用独立历史验证窗口计算，不代表未来中奖概率；程序不会为了显示70%而伪造或泄漏未来数据。</div>
 </div>
 
 <script>
 const RED=new Set([1,2,7,8,12,13,18,19,23,24,29,30,34,35,40,45,46]);
 const BLUE=new Set([3,4,9,10,14,15,20,25,26,31,36,37,41,42,47,48]);
 function cls(n){n=Number(n);return RED.has(n)?'red':(BLUE.has(n)?'blue':'green')}
-let SPECIAL22=[];
+let SPECIAL24=[];
 function fmt(n){return String(n).padStart(2,'0')}
 async function copySpecial(){
-  const text=SPECIAL22.join(' ');
+  const text=SPECIAL24.join(' ');
   try{
     await navigator.clipboard.writeText(text);
   }catch(e){
@@ -242,22 +252,28 @@ async function loadMain(){
     nextIssue.textContent=d.next_issue||'--';
     latestNums.innerHTML=balls(d.latest_numbers||[]);
     if(latestNums.lastElementChild) latestNums.lastElementChild.classList.add('special');
-    SPECIAL22=d.special22||[]; sp.innerHTML=balls(SPECIAL22);
+    SPECIAL24=d.special24||[]; sp.innerHTML=balls(SPECIAL24);
     const pairs=d.zodiac_pairs||[];
     zpair.innerHTML=pairs.map(p=>`<div class="zpair">
       <div class="zpairName">${p.zodiac}</div>
-      <div class="zpairCodes">${(p.codes||[]).map(n=>`<span class="microball ${cls(n)}">${n}</span>`).join('')}</div>
+      <div class="zpairCodes"><span class="microball ${cls(p.code)}">${p.code}</span></div>
+    </div>`).join('');
+    const groups=d.zodiac_groups||[];
+    zgroups.innerHTML=groups.map(g=>`<div class="zpair">
+      <div class="zpairName">${g.zodiac}</div>
+      <div class="zpairCodes">${(g.codes||[]).map(n=>`<span class="microball ${cls(n)}">${n}</span>`).join('')}</div>
     </div>`).join('');
     const tr=d.trend||{};
     const w=tr.wave||{}, sz=tr.size||{}, pa=tr.parity||{};
     waveTrend.innerHTML=`红 ${w['红']??0}%<br>蓝 ${w['蓝']??0}%<br>绿 ${w['绿']??0}%`;
     sizeTrend.innerHTML=`大 ${sz['大']??0}%<br>小 ${sz['小']??0}%`;
     parityTrend.innerHTML=`单 ${pa['单']??0}%<br>双 ${pa['双']??0}%`;
+    const ps=d.profile_scores||{};
+    profileInfo.textContent=`当前模型 ${d.profile||'--'} · 最近校准分 ${ps[d.profile]??0}%`;
     latestZodiac.textContent=d.latest_special_zodiac?`特码生肖 ${d.latest_special_zodiac}`:'特码生肖 --';
     lastIngest.textContent=d.latest_created_at?`最后录入 ${d.latest_created_at}`:'实时录入';
     tg.textContent=d.telegram?'Telegram 已连接':'Telegram 未配置';
-    const ad=d.adaptive||{};
-    adaptiveInfo.textContent=`22码变化 ${ad.changes??0} · 4肖变化 ${ad.zodiac_changes??0} · 敏感度 ${ad.target??0}`;
+    adaptiveInfo.textContent=`自动校准：${d.profile||'--'} · 24码按12肖分层`;
 
   }catch(e){}
 }
@@ -265,8 +281,8 @@ async function loadStats(){
   try{
     const r=await fetch('/api/stats?_='+Date.now(),{cache:'no-store'});
     const st=await r.json();
-    hit22.textContent=(st.hit22??0).toFixed(1)+'%'; err22.textContent='错误 '+(st.err22??0).toFixed(1)+'%';
-    hit4.textContent=(st.hit4??0).toFixed(1)+'%'; err4.textContent='错误 '+(st.err4??0).toFixed(1)+'%';
+    hit22.textContent=(st.hit24??0).toFixed(1)+'%'; err22.textContent='错误 '+(st.err24??0).toFixed(1)+'%';
+    hit4.textContent=(st.hitMain??0).toFixed(1)+'%'; err4.textContent='错误 '+(st.errMain??0).toFixed(1)+'%';
     hitZ.textContent=(st.hitZ??0).toFixed(1)+'%'; errZ.textContent='错误 '+(st.errZ??0).toFixed(1)+'%';
   }catch(e){}
 }
@@ -575,11 +591,9 @@ def _weighted_category(seq, mapper, horizon, half):
     return {k:v/total for k,v in out.items()}
 
 def _trend_profiles(r):
-    """Observed recent distributions. Used as statistical features only."""
     sp=[x["special"] for x in r if x["special"]]
-    # Multi-window weighted average, heavily tilted to recent issues.
     wave=defaultdict(float); size=defaultdict(float); parity=defaultdict(float)
-    cfg=[(8,3,1.55),(16,5,1.25),(36,11,.95),(80,25,.60)]
+    cfg=[(8,3,1.70),(16,5,1.35),(36,11,1.00),(80,25,.55)]
     totalcoef=sum(c for _,_,c in cfg)
     for h,half,c in cfg:
         for k,v in _weighted_category(sp,wave_of,h,half).items(): wave[k]+=c*v
@@ -588,249 +602,244 @@ def _trend_profiles(r):
     for d in (wave,size,parity):
         for k in list(d): d[k]/=totalcoef
 
-    # Acceleration: latest 8 versus preceding 24.
     def accel(mapper, keys):
         a=Counter(mapper(x["special"]) for x in r[:8])
         b=Counter(mapper(x["special"]) for x in r[8:32])
         av={k:a[k]/max(1,min(8,len(r))) for k in keys}
         bv={k:b[k]/max(1,min(24,max(0,len(r)-8))) for k in keys}
         return {k:av[k]-bv[k] for k in keys}
-    wa=accel(wave_of,["红","蓝","绿"])
-    sa=accel(size_of,["大","小"])
-    pa=accel(parity_of,["单","双"])
 
-    # Blend acceleration into a preference score, then convert to display percentages.
     def blend(base, ac, keys):
-        raw={k:max(0.001,base.get(k,0)+0.42*ac.get(k,0)) for k in keys}
+        raw={k:max(.001,base.get(k,0)+.46*ac.get(k,0)) for k in keys}
         z=sum(raw.values())
         return {k:raw[k]/z for k in keys}
+
     return {
-      "wave":blend(wave,wa,["红","蓝","绿"]),
-      "size":blend(size,sa,["大","小"]),
-      "parity":blend(parity,pa,["单","双"])
+      "wave":blend(wave,accel(wave_of,["红","蓝","绿"]),["红","蓝","绿"]),
+      "size":blend(size,accel(size_of,["大","小"]),["大","小"]),
+      "parity":blend(parity,accel(parity_of,["单","双"]),["单","双"])
     }
 
 def _number_zodiac_map(r):
     counts={n:Counter() for n in range(1,50)}
-    for x in r[:min(260,len(r))]:
+    for x in r[:min(600,len(r))]:
         for j in range(1,7):
             n=x[f"n{j}"]; z=normalize_z(x[f"z{j}"] or "")
             if n and z: counts[n][z]+=1
         n=x["special"]; z=normalize_z(x["z7"] or "")
         if n and z: counts[n][z]+=2
-    out={}
-    for n,c in counts.items():
-        if c: out[n]=c.most_common(1)[0][0]
-    return out
+    return {n:c.most_common(1)[0][0] for n,c in counts.items() if c}
 
-def _zodiac_scores(r):
+PROFILE_LIBRARY = {
+  "趋势快": {"recent":1.30,"accel":1.35,"wave":1.20,"size":1.05,"parity":1.00,"zodiac":1.10,"long":.55,"omit":.45},
+  "平衡":   {"recent":1.00,"accel":1.00,"wave":1.00,"size":1.00,"parity":1.00,"zodiac":1.00,"long":1.00,"omit":.75},
+  "热码":   {"recent":1.45,"accel":.90,"wave":.70,"size":.65,"parity":.65,"zodiac":.80,"long":.45,"omit":.25},
+  "结构":   {"recent":.88,"accel":1.05,"wave":1.45,"size":1.30,"parity":1.25,"zodiac":1.35,"long":.70,"omit":.45},
+  "均衡覆盖":{"recent":.82,"accel":.82,"wave":1.10,"size":1.10,"parity":1.10,"zodiac":1.40,"long":1.10,"omit":.90}
+}
+
+def _zodiac_scores_profile(r, profile):
+    p=PROFILE_LIBRARY[profile]
     score=defaultdict(float)
-    # Short windows make 4肖 move more readily.
-    for horizon,half,coef in [(6,2,2.25),(12,4,1.85),(24,8,1.35),(50,16,.90),(120,38,.45)]:
+    for horizon,half,coef in [(6,2,2.30),(12,4,1.90),(24,8,1.38),(50,16,.90),(120,38,.45)]:
         for i,x in enumerate(r[:min(horizon,len(r))]):
-            w=coef*exp_weight(i,half)
+            w=coef*exp_weight(i,half)*p["recent"]
             if x["z7"]:
                 score[normalize_z(x["z7"])]+=1.75*w
             for k in ["z1","z2","z3","z4","z5","z6"]:
                 if x[k]:
-                    score[normalize_z(x[k])]+=0.28*w
+                    score[normalize_z(x[k])]+=.26*w
 
-    # Zodiac acceleration: last 8 specials versus previous 24.
     a=Counter(normalize_z(x["z7"] or "") for x in r[:8] if x["z7"])
     b=Counter(normalize_z(x["z7"] or "") for x in r[8:32] if x["z7"])
-    allz=set(score)|set(a)|set(b)
-    for z in allz:
-        score[z]+=2.0*(a[z]/max(1,min(8,len(r))) - b[z]/max(1,min(24,max(0,len(r)-8))))
+    for z in set(score)|set(a)|set(b):
+        score[z]+=p["accel"]*2.15*(a[z]/max(1,min(8,len(r)))-b[z]/max(1,min(24,max(0,len(r)-8))))
     return score
 
-def _adaptive_zodiac4(r):
-    cur=_zodiac_scores(r)
-    ranked=sorted(cur,key=lambda z:(-cur[z],z))
-    top=ranked[:4]
-    if len(r)<40 or len(ranked)<5:
-        return top, {"changes":0}
-
-    prev=_zodiac_scores(r[1:])
-    prev_top=sorted(prev,key=lambda z:(-prev[z],z))[:4]
-    prev_set=set(prev_top)
-    cur_set=set(top)
-
-    # If unchanged, allow one deterministic trend-driven rotation when an outsider
-    # is close to the weakest incumbent and has stronger momentum.
-    if cur_set==prev_set:
-        momentum={z:cur.get(z,0)-prev.get(z,0) for z in set(cur)|set(prev)}
-        weakest=min(top,key=lambda z:cur.get(z,0))
-        outsiders=[z for z in ranked if z not in cur_set]
-        if outsiders:
-            challenger=max(outsiders,key=lambda z:(momentum.get(z,0),cur.get(z,0)))
-            scale=max(abs(cur.get(top[0],0)-cur.get(weakest,0)),1.0)
-            close=(cur.get(challenger,0) >= cur.get(weakest,0)-0.16*scale)
-            rising=(momentum.get(challenger,0) > momentum.get(weakest,0))
-            if close and rising:
-                top=[z for z in top if z!=weakest]+[challenger]
-                top=sorted(top,key=lambda z:(-cur.get(z,0),z))
-    changes=len(set(top)^prev_set)//2
-    return top, {"changes":changes}
-
-def _recent_volatility(r):
-    if len(r)<40:return .5
-    a=Counter(x["special"] for x in r[:16])
-    b=Counter(x["special"] for x in r[16:32])
-    return max(0.0,min(sum(abs(a[n]-b[n]) for n in range(1,50))/32.0,1.0))
-
-def _base_special_scores(r):
+def _number_scores_profile(r, profile):
+    p=PROFILE_LIBRARY[profile]
     numbers=range(1,50)
     score={n:0.0 for n in numbers}
-    profiles=_trend_profiles(r)
+    trend=_trend_profiles(r)
     zmap=_number_zodiac_map(r)
-    zscore=_zodiac_scores(r)
+    zscore=_zodiac_scores_profile(r,profile)
 
-    # Number-frequency and acceleration.
-    for horizon,half,coef in [(8,3,2.35),(16,5,1.95),(36,11,1.45),(80,25,1.02),(200,65,.58),(800,250,.24)]:
+    for horizon,half,coef in [(8,3,2.40),(16,5,1.95),(36,11,1.45),(80,25,1.00),(200,65,.55),(800,250,.22)]:
         rr=r[:min(horizon,len(r))]
         freq=Counter()
         for i,x in enumerate(rr):
             freq[x["special"]]+=exp_weight(i,half)
         mean=sum(freq.values())/49.0 if rr else 0
+        factor=p["recent"] if horizon<=80 else p["long"]
         for n in numbers:
-            score[n]+=coef*(freq[n]-mean)/math.sqrt(mean+1.0)
+            score[n]+=coef*factor*(freq[n]-mean)/math.sqrt(mean+1.0)
 
-    # Direct acceleration.
-    for short,base,coef in [(8,24,1.45),(16,48,.95)]:
+    for short,base,coef in [(8,24,1.55),(16,48,1.00)]:
         a=Counter(x["special"] for x in r[:short])
         b=Counter(x["special"] for x in r[short:short+base])
         for n in numbers:
-            score[n]+=coef*(a[n]/max(short,1)-b[n]/max(base,1))
+            score[n]+=coef*p["accel"]*(a[n]/max(short,1)-b[n]/max(base,1))
 
-    # Trend-index features: wave + big/small + odd/even.
     for n in numbers:
-        score[n]+=1.05*(profiles["wave"].get(wave_of(n),0)-1/3)
-        score[n]+=0.78*(profiles["size"].get(size_of(n),0)-1/2)
-        score[n]+=0.72*(profiles["parity"].get(parity_of(n),0)-1/2)
+        score[n]+=1.12*p["wave"]*(trend["wave"].get(wave_of(n),0)-1/3)
+        score[n]+=.82*p["size"]*(trend["size"].get(size_of(n),0)-1/2)
+        score[n]+=.76*p["parity"]*(trend["parity"].get(parity_of(n),0)-1/2)
         z=zmap.get(n)
         if z:
-            # Normalize zodiac context to avoid overpowering direct number evidence.
-            score[n]+=0.010*zscore.get(z,0)
+            score[n]+=.012*p["zodiac"]*zscore.get(z,0)
 
-    # Weak long baseline + omission.
     full=Counter(x["special"] for x in r)
     expected=len(r)/49.0
     for n in numbers:
-        score[n]+=0.14*(full[n]-expected)/math.sqrt(expected+7.0)
+        score[n]+=.13*p["long"]*(full[n]-expected)/math.sqrt(expected+7.0)
+
     last={n:len(r) for n in numbers}
     for i,x in enumerate(r):
         if last[x["special"]]==len(r): last[x["special"]]=i
     for n in numbers:
-        score[n]+=0.10*min(last[n],50)/50.0
+        score[n]+=.11*p["omit"]*min(last[n],50)/50.0
     return score
 
-def _adaptive_top22(r):
-    numbers=list(range(1,50))
-    cur=_base_special_scores(r)
-    ranked=sorted(numbers,key=lambda n:(-cur[n],n))
-    if len(r)<50:
-        return ranked[:22],{"changes":0,"target":0,"volatility":0.0}
-    prev=_base_special_scores(r[1:])
-    prev_set=set(sorted(numbers,key=lambda n:(-prev[n],n))[:22])
-    delta={n:cur[n]-prev[n] for n in numbers}
-    vol=_recent_volatility(r)
-    target=max(2,min(int(round(3+vol*5)),8))
-    cutoff=cur[ranked[21]]
-    spread=max(abs(cur[ranked[8]]-cutoff),.18)
-    adjusted={}
-    for n in numbers:
-        boundary=1.0-max(0.0,min(abs(cur[n]-cutoff)/spread,1.0))
-        mom=delta[n]
-        adjusted[n]=cur[n]+mom*(1.45+2.0*vol)*boundary
-        if n in prev_set and mom<0: adjusted[n]+=mom*(.55+vol)
-        if n not in prev_set and mom>0: adjusted[n]+=mom*(.90+1.35*vol)
-    top=sorted(numbers,key=lambda n:(-adjusted[n],n))[:22]
-    changes=len(set(top)^prev_set)//2
-    return top,{"changes":changes,"target":target,"volatility":round(vol,3)}
-
-def _zodiac_code_pairs(r, zodiac4):
-    """For each selected zodiac return 1-3 highest-scoring mapped numbers."""
+def _candidate24_by_zodiac(r, profile):
+    """Exactly 24 candidates. Every zodiac gets 1-3 codes, selected by score."""
     zmap=_number_zodiac_map(r)
-    nscores=_base_special_scores(r)
-    profiles=_trend_profiles(r)
+    ns=_number_scores_profile(r,profile)
+    zs=_zodiac_scores_profile(r,profile)
 
-    # Add recent all-position occurrence rate for code selection.
-    occ=Counter()
-    for i,x in enumerate(r[:80]):
-        w=exp_weight(i,18)
-        occ[x["special"]]+=1.7*w
-        for j in range(1,7): occ[x[f"n{j}"]]+=.55*w
+    pools={z:[] for z in ALL_ZODIACS}
+    for n in range(1,50):
+        z=zmap.get(n)
+        if z in pools:
+            pools[z].append(n)
+    for z in pools:
+        pools[z]=sorted(pools[z],key=lambda n:(-ns[n],n))
 
-    pairs=[]
-    primaries=[]
-    for z in zodiac4:
-        pool=[n for n in range(1,50) if zmap.get(n)==z]
-        if not pool:
-            pool=list(range(1,50))
-        sc={}
-        for n in pool:
-            sc[n]=nscores[n]+0.12*occ[n]
-            sc[n]+=0.30*profiles["wave"].get(wave_of(n),0)
-            sc[n]+=0.18*profiles["size"].get(size_of(n),0)
-            sc[n]+=0.16*profiles["parity"].get(parity_of(n),0)
-        ranked=sorted(pool,key=lambda n:(-sc[n],n))
-        if not ranked:
-            codes=[]
-        elif len(ranked)==1:
-            codes=ranked[:1]
+    # Ensure every zodiac has at least one pool member; history normally covers all.
+    missing=[z for z in ALL_ZODIACS if not pools[z]]
+    unassigned=[n for n in range(1,50) if zmap.get(n) not in pools]
+    for z,n in zip(missing,unassigned):
+        pools[z]=[n]
+
+    quota={z:(1 if pools[z] else 0) for z in ALL_ZODIACS}
+    remaining=24-sum(quota.values())
+
+    # Allocate the extra 12 spots by zodiac trend + marginal next-number score.
+    while remaining>0:
+        options=[]
+        for z in ALL_ZODIACS:
+            q=quota[z]
+            if q>=3 or q>=len(pools[z]): continue
+            nextn=pools[z][q]
+            zbase=zs.get(z,0)
+            marginal=ns[nextn]+.018*zbase
+            options.append((marginal,z))
+        if not options: break
+        _,best=max(options,key=lambda t:(t[0],t[1]))
+        quota[best]+=1
+        remaining-=1
+
+    groups=[]
+    selected=[]
+    for z in ALL_ZODIACS:
+        codes=pools[z][:quota[z]]
+        groups.append({"zodiac":z,"codes":codes})
+        selected.extend(codes)
+
+    # Fallback: if mapping gaps left us short, fill by global score without duplicates.
+    if len(selected)<24:
+        for n in sorted(range(1,50),key=lambda n:(-ns[n],n)):
+            if n not in selected:
+                selected.append(n)
+            if len(selected)>=24: break
+    elif len(selected)>24:
+        selected=sorted(selected,key=lambda n:(-ns[n],n))[:24]
+
+    return selected,groups,ns,zs
+
+def _predict_with_profile(r, profile):
+    cand24,groups,ns,zs=_candidate24_by_zodiac(r,profile)
+    z4=sorted(ALL_ZODIACS,key=lambda z:(-zs.get(z,-1e9),z))[:4]
+
+    # Exactly one main code under each selected zodiac, and it must be inside the 24.
+    groupmap={g["zodiac"]:g["codes"] for g in groups}
+    main4=[]
+    zpair=[]
+    for z in z4:
+        codes=groupmap.get(z,[])
+        if codes:
+            main=max(codes,key=lambda n:(ns[n],-n))
         else:
-            # Dynamic 1-3 count based on score concentration.
-            top=sc[ranked[0]]
-            second=sc[ranked[1]]
-            third=sc[ranked[2]] if len(ranked)>2 else -1e9
-            denom=max(abs(top),.5)
-            if (top-second)/denom > .28:
-                k=1
-            elif len(ranked)>2 and (second-third)/denom < .10:
-                k=3
-            else:
-                k=2
-            codes=ranked[:k]
-        if codes: primaries.append(codes[0])
-        pairs.append({"zodiac":z,"codes":codes})
-    return pairs,primaries
+            pool=[n for n in cand24 if _number_zodiac_map(r).get(n)==z]
+            main=max(pool,key=lambda n:(ns[n],-n)) if pool else max(cand24,key=lambda n:(ns[n],-n))
+        main4.append(main)
+        zpair.append({"zodiac":z,"code":main})
+    return cand24,main4,z4,groups,zpair
 
-def predict_core(r):
+def _profile_score_on_recent(r, profile, samples=28):
+    if len(r)<260:
+        return 0.0
+    tests=min(samples,len(r)-220)
+    h24=hmain=hz=0
+    n=0
+    for k in range(tests-1,-1,-1):
+        train=r[k+1:]
+        if len(train)<220: continue
+        c24,m4,z4,_,_=_predict_with_profile(train,profile)
+        actual=r[k]
+        sp=actual["special"]
+        az=normalize_z(actual["z7"] or "")
+        h24+=int(sp in c24)
+        hmain+=int(sp in m4)
+        hz+=int(bool(az) and az in z4)
+        n+=1
+    if not n: return 0.0
+    # Coverage is the main objective, but 4肖/一肖一码 matter too.
+    return (.58*h24 + .17*hmain + .25*hz)/n
+
+def _select_profile(r):
+    scores={name:_profile_score_on_recent(r,name,28) for name in PROFILE_LIBRARY}
+    best=max(scores,key=lambda k:(scores[k],k))
+    return best,{k:round(v*100,1) for k,v in scores.items()}
+
+def predict_core(r, profile=None):
     if not r:return [],[],[]
-    top22,_=_adaptive_top22(r)
-    zodiac4,_=_adaptive_zodiac4(r)
-    pairs,primaries=_zodiac_code_pairs(r,zodiac4)
-    # codes4 are the primary code under each zodiac, so they always correspond.
-    return top22,primaries,zodiac4
+    profile=profile or _select_profile(r)[0]
+    c24,m4,z4,_,_=_predict_with_profile(r,profile)
+    return c24,m4,z4
 
 def backtest_stats(r, sample=60):
-    if not r or len(r)<350:
-        return {"n":0,"hit22":0.0,"err22":100.0,"hit4":0.0,"err4":100.0,"hitZ":0.0,"errZ":100.0}
+    if not r or len(r)<420:
+        return {"n":0,"hit24":0.0,"err24":100.0,"hitMain":0.0,"errMain":100.0,"hitZ":0.0,"errZ":100.0,"profile":"--"}
     latest_issue=r[0]["issue"]
     if stats_cache["issue"]==latest_issue and stats_cache["value"] is not None:
         return stats_cache["value"]
 
-    tests=min(sample, len(r)-300)
-    h22=h4=hz=0
+    tests=min(sample,len(r)-320)
+
+    # Honest split: choose the model using data older than the validation window.
+    calibration_source=r[tests:]
+    profile,_scores=_select_profile(calibration_source)
+
+    h24=hmain=hz=0
     actual_tests=0
-    # r is newest -> oldest. Predict target r[k] using only older rows r[k+1:].
     for k in range(tests-1,-1,-1):
         train=r[k+1:]
-        if len(train)<300: continue
-        p22,p4,pz=predict_core(train)
+        if len(train)<260: continue
+        c24,m4,z4,_,_=_predict_with_profile(train,profile)
         actual=r[k]
-        actual_special=actual["special"]
-        actual_z=normalize_z(actual["z7"] or "")
-        h22 += int(actual_special in p22)
-        h4 += int(actual_special in p4)
-        hz += int(bool(actual_z) and actual_z in pz)
-        actual_tests += 1
+        sp=actual["special"]
+        az=normalize_z(actual["z7"] or "")
+        h24+=int(sp in c24)
+        hmain+=int(sp in m4)
+        hz+=int(bool(az) and az in z4)
+        actual_tests+=1
 
     n=max(actual_tests,1)
     val={
       "n":actual_tests,
-      "hit22":round(h22/n*100,1),"err22":round((actual_tests-h22)/n*100,1),
-      "hit4":round(h4/n*100,1),"err4":round((actual_tests-h4)/n*100,1),
+      "profile":profile,
+      "hit24":round(h24/n*100,1),"err24":round((actual_tests-h24)/n*100,1),
+      "hitMain":round(hmain/n*100,1),"errMain":round((actual_tests-hmain)/n*100,1),
       "hitZ":round(hz/n*100,1),"errZ":round((actual_tests-hz)/n*100,1)
     }
     stats_cache["issue"]=latest_issue
@@ -840,11 +849,9 @@ def backtest_stats(r, sample=60):
 def build_model():
     r=all_rows()
     if not r:
-        return {"issue":None,"count":0,"special22":[],"codes4":[],"zodiac4":[],"zodiac_pairs":[],"telegram":bool(BOT_TOKEN)}
-    top22,codes,zodiac=predict_core(r)
-    _tmp22,adaptive_meta=_adaptive_top22(r)
-    _ztop,zmeta=_adaptive_zodiac4(r)
-    zpairs,_primary=_zodiac_code_pairs(r,zodiac)
+        return {"issue":None,"count":0,"special24":[],"main4":[],"zodiac4":[],"zodiac_groups":[],"zodiac_pairs":[],"telegram":bool(BOT_TOKEN)}
+    profile,profile_scores=_select_profile(r)
+    c24,m4,z4,groups,zpairs=_predict_with_profile(r,profile)
     trend=_trend_profiles(r)
     latest=r[0]
     latest_numbers=[latest[f"n{i}"] for i in range(1,7)]+[latest["special"]]
@@ -855,11 +862,13 @@ def build_model():
       "latest_numbers":latest_numbers,
       "latest_special_zodiac":normalize_z(latest["z7"] or ""),
       "latest_created_at":latest["created_at"] or "",
-      "special22":[f"{n:02d}" for n in sorted(top22)],
-      "codes4":[f"{n:02d}" for n in codes],
-      "zodiac4":zodiac,
-      "zodiac_pairs":[{"zodiac":p["zodiac"],"codes":[f"{n:02d}" for n in p["codes"]]} for p in zpairs],
-      "adaptive":{**adaptive_meta,"zodiac_changes":zmeta.get("changes",0)},
+      "special24":[f"{n:02d}" for n in sorted(c24)],
+      "main4":[f"{n:02d}" for n in m4],
+      "zodiac4":z4,
+      "zodiac_pairs":[{"zodiac":p["zodiac"],"code":f"{p['code']:02d}"} for p in zpairs],
+      "zodiac_groups":[{"zodiac":g["zodiac"],"codes":[f"{n:02d}" for n in g["codes"]]} for g in groups],
+      "profile":profile,
+      "profile_scores":profile_scores,
       "trend":{
         "wave":{k:round(v*100,1) for k,v in trend["wave"].items()},
         "size":{k:round(v*100,1) for k,v in trend["size"].items()},
@@ -867,7 +876,6 @@ def build_model():
       },
       "telegram":bool(BOT_TOKEN)
     }
-
 
 def rebuild_live_cache():
     with live_cache_lock:
