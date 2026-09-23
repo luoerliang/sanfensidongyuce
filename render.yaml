@@ -1,11 +1,13 @@
 services:
   - type: web
-    name: sanfen-webhook-v11
+    name: sanfensidongyuce-3
     runtime: docker
     envVars:
       - key: BOT_TOKEN
         sync: false
       - key: ALLOWED_CHAT_ID
-        sync: false
+        value: "-5560268424"
       - key: DB_PATH
         value: history.db
+      - key: HISTORY_SOURCE_URL
+        value: https://sanfensidongyuce-2.onrender.com/api/history?limit=500

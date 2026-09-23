@@ -18,6 +18,14 @@ WEBHOOK_PATH = "/telegram/webhook"
 WEBHOOK_SECRET = hashlib.sha256(BOT_TOKEN.encode("utf-8")).hexdigest()[:48] if BOT_TOKEN else ""
 TG_API = f"https://api.telegram.org/bot{BOT_TOKEN}" if BOT_TOKEN else ""
 
+# 你当前线上服务的历史接口。v13 首次部署到“新服务”时会自动同步进去。
+DEFAULT_HISTORY_SOURCE = "https://sanfensidongyuce-2.onrender.com/api/history?limit=500"
+HISTORY_SOURCE_URL = os.getenv("HISTORY_SOURCE_URL", DEFAULT_HISTORY_SOURCE).strip()
+
+live_cache = {"issue": None, "data": None, "building": False}
+live_cache_lock = threading.Lock()
+sync_state = {"source": HISTORY_SOURCE_URL, "imported": 0, "last_error": "", "last_sync": ""}
+
 app = Flask(__name__)
 db_lock = threading.Lock()
 stats_cache = {"issue": None, "value": None}
@@ -118,7 +126,7 @@ box-shadow:0 12px 30px #0007;opacity:0;pointer-events:none;transition:.2s;z-inde
     <div class="livebox"><span class="dot"></span><span>实时录入</span></div>
     <div style="text-align:right">
       <div class="title">三分彩 · 智能看板</div>
-      <div class="subtitle">TG自动入库 · 动态模型 · 每10秒刷新</div>
+      <div class="subtitle">TG自动入库 · 新开奖才重算 · 1秒读取缓存</div>
     </div>
   </div>
 
@@ -272,7 +280,7 @@ async function loadHistory(){
   }catch(e){}
 }
 loadMain(); loadStats(); loadHistory();
-setInterval(loadMain,2000);
+setInterval(loadMain,1000);
 setInterval(loadStats,30000);
 setInterval(loadHistory,20000);
 </script>
@@ -326,6 +334,105 @@ def import_history_once():
                 VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",[issue,*nums,*zs,"history.csv"])
         c.commit(); c.close()
 
+
+def _insert_migrated_draw(c, item):
+    """Accept v12 /api/history item or v13 /api/export full row."""
+    issue=str(item.get("issue") or item.get("期号") or "").strip()
+    if not issue:
+        return 0
+
+    # Full export format.
+    if all(k in item for k in ["n1","n2","n3","n4","n5","n6","special"]):
+        try:
+            nums=[int(item[f"n{i}"]) for i in range(1,7)] + [int(item["special"])]
+        except Exception:
+            return 0
+        zs=[normalize_z(str(item.get(f"z{i}") or "")) for i in range(1,8)]
+        cs=[str(item.get(f"c{i}") or "") for i in range(1,8)]
+        raw=str(item.get("raw") or "remote-export")
+        created=str(item.get("created_at") or "")
+    else:
+        # Old /api/history format: issue + numbers[7] + special zodiac only.
+        try:
+            nums=[int(x) for x in item.get("numbers",[])]
+        except Exception:
+            return 0
+        if len(nums)!=7:
+            return 0
+        zs=["","","","","","",normalize_z(str(item.get("zodiac") or ""))]
+        cs=[""]*7
+        raw="remote-history-migration"
+        created=str(item.get("created_at") or "")
+
+    if len(set(nums))!=7 or not all(1<=n<=49 for n in nums):
+        return 0
+
+    before=c.total_changes
+    c.execute("""INSERT OR IGNORE INTO draws
+      (issue,n1,n2,n3,n4,n5,n6,special,z1,z2,z3,z4,z5,z6,z7,
+       c1,c2,c3,c4,c5,c6,c7,raw,created_at)
+      VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,COALESCE(NULLIF(?,''),CURRENT_TIMESTAMP))""",
+      [issue,*nums,*zs,*cs,raw,created])
+    return 1 if c.total_changes>before else 0
+
+def sync_remote_history(url=None):
+    """Merge history from the currently-live old service before switching versions."""
+    url=(url or HISTORY_SOURCE_URL or "").strip()
+    if not url:
+        return 0
+    try:
+        # Try the exact supplied URL first.
+        r=requests.get(url,timeout=25,headers={"User-Agent":"SanfenMigration/13"})
+        r.raise_for_status()
+        payload=r.json()
+        items=payload.get("items") if isinstance(payload,dict) else payload
+        if not isinstance(items,list):
+            raise ValueError("remote history response has no items list")
+
+        imported=0
+        with db_lock:
+            c=connect()
+            for item in items:
+                if isinstance(item,dict):
+                    imported += _insert_migrated_draw(c,item)
+            c.commit()
+            c.close()
+
+        sync_state["source"]=url
+        sync_state["imported"]=imported
+        sync_state["last_error"]=""
+        sync_state["last_sync"]=time.strftime("%Y-%m-%d %H:%M:%S")
+        print(f"[SYNC] imported={imported} from {url}",flush=True)
+        return imported
+    except Exception as e:
+        sync_state["source"]=url
+        sync_state["last_error"]=f"{type(e).__name__}: {e}"
+        sync_state["last_sync"]=time.strftime("%Y-%m-%d %H:%M:%S")
+        print(f"[SYNC] failed from {url}: {type(e).__name__}: {e}",flush=True)
+        return 0
+
+def sync_best_available_history():
+    """Prefer a full export when the source supports it; fall back to the URL user supplied."""
+    urls=[]
+    if HISTORY_SOURCE_URL:
+        # If source is an old /api/history URL, try it exactly.
+        urls.append(HISTORY_SOURCE_URL)
+        # If it has a service base, also try the future full export endpoint.
+        if "/api/" in HISTORY_SOURCE_URL:
+            base=HISTORY_SOURCE_URL.split("/api/",1)[0]
+            urls.insert(0,base+"/api/export?limit=20000")
+    seen=set()
+    total=0
+    for u in urls:
+        if u in seen: continue
+        seen.add(u)
+        n=sync_remote_history(u)
+        total+=n
+        # A successful response with imported 0 may simply mean everything is already present.
+        if not sync_state["last_error"]:
+            break
+    return total
+
 def parse_draw(text):
     m=re.search(r"第\s*[:：]?\s*(\d{8,})\s*期",text)
     if not m:return None
@@ -359,6 +466,10 @@ def add_draw(issue,nums,zs,colors,raw):
         if changed:
             stats_cache["issue"]=None
             stats_cache["value"]=None
+            with live_cache_lock:
+                live_cache["issue"]=None
+                live_cache["data"]=None
+            threading.Thread(target=rebuild_live_cache,daemon=True,name="model-rebuild").start()
         return changed
 
 def all_rows():
@@ -655,7 +766,7 @@ def backtest_stats(r, sample=60):
     stats_cache["value"]=val
     return val
 
-def model():
+def build_model():
     r=all_rows()
     if not r:
         return {"issue":None,"count":0,"special22":[],"codes4":[],"zodiac4":[],"zodiac_pairs":[],"telegram":bool(BOT_TOKEN)}
@@ -686,6 +797,31 @@ def model():
       "telegram":bool(BOT_TOKEN)
     }
 
+
+def rebuild_live_cache():
+    with live_cache_lock:
+        if live_cache.get("building"):
+            return live_cache.get("data")
+        live_cache["building"]=True
+    try:
+        data=build_model()
+        with live_cache_lock:
+            live_cache["data"]=data
+            live_cache["issue"]=data.get("issue") if isinstance(data,dict) else None
+        return data
+    finally:
+        with live_cache_lock:
+            live_cache["building"]=False
+
+def model():
+    """Fast path for the web page: normally returns the already-built result."""
+    with live_cache_lock:
+        data=live_cache.get("data")
+    if data is not None:
+        return data
+    return rebuild_live_cache() or build_model()
+
+
 @app.get("/")
 def home():
     return render_template_string(INDEX_HTML)
@@ -696,8 +832,10 @@ def health():
 
 @app.get("/api/prediction")
 def prediction():
-    # Lightweight live endpoint: does not run the historical backtest.
-    return jsonify(model())
+    # Cached live endpoint: normally no full-history calculation happens here.
+    resp=jsonify(model())
+    resp.headers["Cache-Control"]="no-store, no-cache, must-revalidate, max-age=0"
+    return resp
 
 @app.get("/api/stats")
 def stats_api():
@@ -705,7 +843,7 @@ def stats_api():
 
 @app.get("/api/history")
 def history():
-    try: limit=max(20,min(int(request.args.get("limit","200")),500))
+    try: limit=max(20,min(int(request.args.get("limit","200")),20000))
     except Exception: limit=200
     c=connect()
     total=c.execute("SELECT COUNT(*) FROM draws").fetchone()[0]
@@ -721,6 +859,35 @@ def history():
           "created_at":x["created_at"] or ""
         })
     return jsonify({"total":total,"items":items})
+
+@app.get("/api/export")
+def export_history():
+    try:
+        limit=max(20,min(int(request.args.get("limit","20000")),30000))
+    except Exception:
+        limit=20000
+    c=connect()
+    rr=c.execute("""SELECT * FROM draws
+                    ORDER BY CAST(issue AS INTEGER) DESC LIMIT ?""",(limit,)).fetchall()
+    total=c.execute("SELECT COUNT(*) FROM draws").fetchone()[0]
+    c.close()
+    items=[]
+    for x in rr:
+        items.append({k:x[k] for k in x.keys()})
+    return jsonify({"total":total,"items":items})
+
+@app.get("/api/sync-status")
+def sync_status():
+    return jsonify({**sync_state,"history_count":len(all_rows())})
+
+@app.post("/api/sync-history")
+def sync_history_now():
+    body=request.get_json(silent=True) or {}
+    url=str(body.get("url") or HISTORY_SOURCE_URL or "").strip()
+    n=sync_remote_history(url)
+    rebuild_live_cache()
+    return jsonify({"ok":not bool(sync_state["last_error"]),"imported":n,**sync_state})
+
 
 def tg_send(chat_id, text, reply_to_message_id=None):
     if not BOT_TOKEN:
@@ -838,6 +1005,14 @@ def webhook_status():
 def boot():
     init_db()
     import_history_once()
+
+    # IMPORTANT: pull the bot-collected history from the currently-live old service
+    # before this new version becomes the active deployment.
+    sync_best_available_history()
+
+    # Build once; page refreshes then read this cache in milliseconds.
+    rebuild_live_cache()
+
     if BOT_TOKEN:
         threading.Thread(target=webhook_keeper,daemon=True,name="telegram-webhook-keeper").start()
 
