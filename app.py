@@ -85,6 +85,10 @@ ai_state = {
     "bootstrapping": False,
     "historical_validation_n": 0,
     "historical_hit24": 0.0,
+    "rolling_window": 100,
+    "rolling_trained": 0,
+    "refit_count": 0,
+    "last_refit_seconds": 0.0,
     "updated_at": ""
 }
 
@@ -385,8 +389,8 @@ async function loadMain(){
     const lr=d.learning||{};
     const ail=lr.ai_live||{};
     const au=lr.auto||{};
-    learningState.innerHTML=`AI累计更新 ${lr.ai_trained??0} 次（自动）<br>AI融合 ${lr.ai_mix_pct??0}% · 实盘24码 ${ail.hit24??0}% (${ail.n??0}/60)`;
-    learningProgress.innerHTML=`模型结算 ${lr.settled??0}/60 期 · ${au.updating?'正在自动更新':'已自动更新'}<br>下一期 ${au.last_prediction_issue||d.next_issue||'--'} · ${au.last_error?'异常':'正常'}`;
+    learningState.innerHTML=`AI滚动训练 ${lr.ai_rolling_trained??0}/100期 · 融合 ${lr.ai_mix_pct??0}%<br>实盘24码 ${ail.hit24??0}% (${ail.n??0}/60)`;
+    learningProgress.innerHTML=`100期重训 ${lr.ai_refit_count??0} 次 · 上次 ${lr.ai_refit_seconds??0}s<br>${au.updating?'正在扫描100期训练':'训练完成'} · 下一期 ${au.last_prediction_issue||d.next_issue||'--'}`;
     const sg=d.strategy||{};
     coldSignal.innerHTML=sg.cold_rebound_now?'冷反弹信号：启用<br>24码允许热+冷防守':'冷反弹信号：普通<br>仍以热码为主';
     coldZodiac.innerHTML=(sg.cold_zodiacs||[]).length?`偏冷：${sg.cold_zodiacs.join('、')}`:'暂无';
@@ -424,8 +428,8 @@ async function loadAutoStatus(){
     const r=await fetch('/api/auto-status?_='+Date.now(),{cache:'no-store'});
     const a=await r.json();
     const n=a.ai_live||{};
-    learningState.innerHTML=`AI累计更新 ${a.ai_trained??0} 次（自动）<br>AI融合 ${a.ai_mix_pct??0}% · 实盘24码 ${n.hit24??0}% (${n.n??0}/60)`;
-    learningProgress.innerHTML=`模型结算 ${a.model_settled??0}/60 期 · ${a.updating?'正在自动更新':'已自动更新'}<br>下一期 ${a.last_prediction_issue||'--'} · ${a.last_error?'异常':'正常'}`;
+    learningState.innerHTML=`AI滚动训练 ${a.ai_rolling_trained??0}/100期 · 融合 ${a.ai_mix_pct??0}%<br>实盘24码 ${n.hit24??0}% (${n.n??0}/60)`;
+    learningProgress.innerHTML=`100期重训 ${a.ai_refit_count??0} 次 · 上次 ${a.ai_refit_seconds??0}s<br>${a.updating?'正在扫描100期训练':'训练完成'} · 下一期 ${a.last_prediction_issue||'--'}`;
   }catch(e){}
 }
 async function loadHistory(){
@@ -529,6 +533,16 @@ def init_db():
         c.execute("""INSERT OR IGNORE INTO ai_model
           (id,weights,steps,trained,last_issue,lr)
           VALUES (1,?,0,0,'',0.08)""",(json.dumps([0.0]*len(AI_FEATURES)),))
+        for _sql in [
+            "ALTER TABLE ai_model ADD COLUMN rolling_window INTEGER DEFAULT 100",
+            "ALTER TABLE ai_model ADD COLUMN rolling_trained INTEGER DEFAULT 0",
+            "ALTER TABLE ai_model ADD COLUMN refit_count INTEGER DEFAULT 0",
+            "ALTER TABLE ai_model ADD COLUMN last_refit_seconds REAL DEFAULT 0.0"
+        ]:
+            try:
+                c.execute(_sql)
+            except sqlite3.OperationalError:
+                pass
         for _p in ["趋势快","平衡","热码","结构","均衡覆盖"]:
             c.execute("INSERT OR IGNORE INTO learner_scores(profile,weight) VALUES (?,1.0)",(_p,))
         c.commit(); c.close()
@@ -1545,6 +1559,10 @@ def load_ai_state():
         ai_state["ready"]=ai_state["trained"]>0
         ai_state["historical_validation_n"]=int(row["historical_validation_n"] or 0)
         ai_state["historical_hit24"]=float(row["historical_hit24"] or 0.0)
+        ai_state["rolling_window"]=int(row["rolling_window"] or 100) if "rolling_window" in row.keys() else 100
+        ai_state["rolling_trained"]=int(row["rolling_trained"] or 0) if "rolling_trained" in row.keys() else 0
+        ai_state["refit_count"]=int(row["refit_count"] or 0) if "refit_count" in row.keys() else 0
+        ai_state["last_refit_seconds"]=float(row["last_refit_seconds"] or 0.0) if "last_refit_seconds" in row.keys() else 0.0
         ai_state["updated_at"]=str(row["updated_at"] or "")
 
 def save_ai_state():
@@ -1554,7 +1572,11 @@ def save_ai_state():
             int(ai_state["steps"]),int(ai_state["trained"]),
             str(ai_state["last_issue"]),float(ai_state["lr"]),
             int(ai_state["historical_validation_n"]),
-            float(ai_state["historical_hit24"])
+            float(ai_state["historical_hit24"]),
+            int(ai_state.get("rolling_window",100)),
+            int(ai_state.get("rolling_trained",0)),
+            int(ai_state.get("refit_count",0)),
+            float(ai_state.get("last_refit_seconds",0.0))
         )
     with db_lock:
         c=connect()
@@ -1562,6 +1584,7 @@ def save_ai_state():
             c.execute("""UPDATE ai_model SET
               weights=?,steps=?,trained=?,last_issue=?,lr=?,
               historical_validation_n=?,historical_hit24=?,
+              rolling_window=?,rolling_trained=?,refit_count=?,last_refit_seconds=?,
               updated_at=CURRENT_TIMESTAMP WHERE id=1""",payload)
             c.commit()
         finally:
@@ -1717,80 +1740,103 @@ def ai_live_validation_stats(window=60):
       "hitPingte":round(100*hp/n,1)
     }
 
-def bootstrap_ai_history():
-    """Background pretraining + 60-issue walk-forward validation.
-    Uses only older data for each prediction; latest 60 are never used to train before prediction."""
+
+def _softmax_probs_from_X(X, weights):
+    logits={}
+    for n in range(1,50):
+        logits[n]=sum(a*b for a,b in zip(weights,X[n]))
+    mx=max(logits.values())
+    ex={n:math.exp(max(-30,min(30,logits[n]-mx))) for n in logits}
+    z=sum(ex.values()) or 1.0
+    return {n:ex[n]/z for n in ex}
+
+def retrain_ai_rolling_100(issue=""):
+    """Re-fit the short-term AI from the latest 100 COMPLETED draws every issue.
+
+    For each historical target inside the window, features are built only from
+    rows older than that target. The target itself is never present in its input.
+    This avoids repeatedly double-counting one new issue and makes the AI adapt
+    to the latest 100-period regime.
+    """
     with ai_lock:
-        if ai_state["bootstrapping"] or ai_state["trained"]>=60:
+        if ai_state.get("bootstrapping"):
             return
         ai_state["bootstrapping"]=True
 
     t0=time.time()
     try:
-        rows=recent_rows(520)
-        if len(rows)<260:
+        # 100 target draws + enough older context for feature calculation.
+        rows=recent_rows(360)
+        if len(rows)<180:
             return
 
-        # Start from fresh weights only when no inherited AI exists.
-        with ai_lock:
-            inherited=ai_state["trained"]>0
-        if inherited:
+        target_count=min(100, len(rows)-140)
+        if target_count < 30:
             return
 
-        # Train on older 120 transitions, ending before the 60-validation block.
-        train_start=min(len(rows)-2,240)
-        train_end=60
-        for k in range(train_start,train_end,-1):
-            state=rows[k+1:]
-            if len(state)<100:
-                continue
-            ai_train_one(state,rows[k]["special"],rows[k]["issue"],persist=False)
+        # Refit from a neutral seed each time. Long-history knowledge is already
+        # present as an input feature, so old regimes do not dominate forever.
+        weights=[0.0]*len(AI_FEATURES)
+        base_lr=0.095
+        steps=0
 
-        # Prequential validation over the latest 60:
-        # predict each issue using only older rows, then learn from that issue.
-        hits=0
-        tested=0
-        for k in range(59,-1,-1):
+        # Oldest -> newest inside the latest 100 completed outcomes.
+        for k in range(target_count-1,-1,-1):
             state=rows[k+1:]
             if len(state)<120:
                 continue
-            zmap=_number_zodiac_map(state)
-            _X,_lg,probs=_ai_logits_and_probs(state)
-            pools={z:[] for z in ALL_ZODIACS}
-            for n in range(1,50):
-                z=zmap.get(n)
-                if z in pools:
-                    pools[z].append(n)
-            cand=[]
-            for z in ALL_ZODIACS:
-                cand += sorted(pools[z],key=lambda n:(-probs.get(n,0.0),n))[:2]
-            cand=list(dict.fromkeys(cand))[:24]
-            hits += int(rows[k]["special"] in cand)
-            tested += 1
-            ai_train_one(state,rows[k]["special"],rows[k]["issue"],persist=False)
+            X=_ai_feature_matrix(state)
+            probs=_softmax_probs_from_X(X,weights)
+            y=int(rows[k]["special"])
 
+            expected=[0.0]*len(AI_FEATURES)
+            for n,p in probs.items():
+                xn=X[n]
+                for j,v in enumerate(xn):
+                    expected[j]+=p*v
+            grad=[X[y][j]-expected[j] for j in range(len(AI_FEATURES))]
+
+            # Give newer outcomes modestly more influence while still using all 100.
+            recency=0.68 + 0.32*((target_count-k)/max(1,target_count))
+            lr=(base_lr*recency)/math.sqrt(1.0+steps/70.0)
+            for j in range(len(weights)):
+                weights[j]=(1.0-0.0008*lr)*weights[j] + lr*grad[j]
+                weights[j]=max(-6.0,min(6.0,weights[j]))
+            steps+=1
+
+        elapsed=time.time()-t0
         with ai_lock:
-            ai_state["historical_validation_n"]=tested
-            ai_state["historical_hit24"]=round(100*hits/tested,1) if tested else 0.0
+            ai_state["weights"]=weights
+            ai_state["steps"]=int(ai_state.get("steps",0))+steps
+            ai_state["trained"]=max(int(ai_state.get("trained",0)),target_count)
+            ai_state["rolling_window"]=100
+            ai_state["rolling_trained"]=target_count
+            ai_state["refit_count"]=int(ai_state.get("refit_count",0))+1
+            ai_state["last_refit_seconds"]=round(elapsed,2)
+            ai_state["last_issue"]=str(issue or (rows[0]["issue"] if rows else ""))
+            ai_state["ready"]=steps>0
+            ai_state["updated_at"]=time.strftime("%Y-%m-%d %H:%M:%S")
         save_ai_state()
-        print(f"[AI] bootstrap trained={ai_state['trained']} validation={tested} hit24={ai_state['historical_hit24']}% in {time.time()-t0:.2f}s",flush=True)
+        print(
+            f"[AI100] refit issue={issue or rows[0]['issue']} "
+            f"window={target_count} steps={steps} in {elapsed:.2f}s",
+            flush=True
+        )
     except Exception as e:
-        print(f"[AI] bootstrap failed: {type(e).__name__}: {e}",flush=True)
+        print(f"[AI100] refit failed: {type(e).__name__}: {e}",flush=True)
     finally:
         with ai_lock:
             ai_state["bootstrapping"]=False
 
+def bootstrap_ai_history():
+    """On deploy/restart, rebuild the current rolling-100 AI in the background."""
+    retrain_ai_rolling_100("boot")
+
+
 def train_ai_after_new_draw(issue, nums):
-    """Use the state that existed immediately before the new draw."""
-    try:
-        rows=recent_rows(800)
-        if not rows or str(rows[0]["issue"])!=str(issue):
-            return
-        state=rows[1:]
-        ai_train_one(state,int(nums[6]),str(issue),persist=True)
-        print(f"[AI] online update issue={issue} trained={ai_state['trained']}",flush=True)
-    except Exception as e:
-        print(f"[AI] online update failed: {type(e).__name__}: {e}",flush=True)
+    """After each draw, re-train on the latest rolling 100 completed draws."""
+    retrain_ai_rolling_100(str(issue))
+
 
 def _candidate24_by_zodiac(r, profile):
     """Exactly 24 = 12 zodiacs × 2 codes.
@@ -1806,8 +1852,10 @@ def _candidate24_by_zodiac(r, profile):
     if ai_ready:
         _X,_lg,ai_probs=_ai_logits_and_probs(r)
         ai_norm=_normalize_ai_probs(ai_probs)
-        maturity=min(1.0,ai_trained/60.0)
-        ai_mix=0.18+0.32*maturity   # 18% early -> 50% after 60+ updates
+        with ai_lock:
+            rolling_trained=int(ai_state.get("rolling_trained",0))
+        maturity=min(1.0,rolling_trained/100.0)
+        ai_mix=0.20+0.30*maturity   # 20% early -> 50% with a full 100-period refit
     else:
         ai_norm={n:.5 for n in range(1,50)}
         ai_mix=0.0
@@ -2196,14 +2244,19 @@ def import_learning_payload(payload):
                     try:
                         c.execute("""UPDATE ai_model SET weights=?,steps=?,trained=?,
                                      last_issue=?,lr=?,historical_validation_n=?,
-                                     historical_hit24=?,updated_at=CURRENT_TIMESTAMP
-                                     WHERE id=1""",
+                                     historical_hit24=?,rolling_window=?,rolling_trained=?,
+                                     refit_count=?,last_refit_seconds=?,
+                                     updated_at=CURRENT_TIMESTAMP WHERE id=1""",
                                   (weights,int(ai_payload.get("steps") or 0),
                                    int(ai_payload.get("trained") or 0),
                                    str(ai_payload.get("last_issue") or ""),
                                    float(ai_payload.get("lr") or .08),
                                    int(ai_payload.get("historical_validation_n") or 0),
-                                   float(ai_payload.get("historical_hit24") or 0.0)))
+                                   float(ai_payload.get("historical_hit24") or 0.0),
+                                   int(ai_payload.get("rolling_window") or 100),
+                                   int(ai_payload.get("rolling_trained") or 0),
+                                   int(ai_payload.get("refit_count") or 0),
+                                   float(ai_payload.get("last_refit_seconds") or 0.0)))
                         c.commit()
                     finally:
                         c.close()
@@ -2446,8 +2499,12 @@ def build_model():
         "rate24":(learner_cache.get("profiles",{}).get(learner_cache.get("best_profile","平衡"),{}) or {}).get("rate24",0.0),
         "ai_trained":ai_state.get("trained",0),
         "ai_ready":ai_state.get("ready",False),
+        "ai_rolling_window":ai_state.get("rolling_window",100),
+        "ai_rolling_trained":ai_state.get("rolling_trained",0),
+        "ai_refit_count":ai_state.get("refit_count",0),
+        "ai_refit_seconds":ai_state.get("last_refit_seconds",0.0),
         "ai_mix_pct":(
-            round((0.18+0.32*min(1.0,float(ai_state.get("trained",0))/60.0))*100,1)
+            round((0.20+0.30*min(1.0,float(ai_state.get("rolling_trained",0))/100.0))*100,1)
             if ai_state.get("ready",False) else 0.0
         ),
         "ai_history_n":ai_state.get("historical_validation_n",0),
@@ -2610,7 +2667,8 @@ def auto_status():
         profiles=dict(learner_cache.get("profiles",{}) or {})
     live=ai_live_validation_stats(60)
     trained=int(ai_state.get("trained",0))
-    mix=round((0.18+0.32*min(1.0,trained/60.0))*100,1) if ai_state.get("ready",False) else 0.0
+    rolling_trained=int(ai_state.get("rolling_trained",0))
+    mix=round((0.20+0.30*min(1.0,rolling_trained/100.0))*100,1) if ai_state.get("ready",False) else 0.0
     return jsonify({
       "ok":True,
       "updating":bool(auto_state.get("updating",False)),
@@ -2620,6 +2678,10 @@ def auto_status():
       "last_refresh_at":auto_state.get("last_refresh_at",""),
       "last_error":auto_state.get("last_error",""),
       "ai_trained":trained,
+      "ai_rolling_window":int(ai_state.get("rolling_window",100)),
+      "ai_rolling_trained":rolling_trained,
+      "ai_refit_count":int(ai_state.get("refit_count",0)),
+      "ai_refit_seconds":float(ai_state.get("last_refit_seconds",0.0)),
       "ai_mix_pct":mix,
       "ai_live":live,
       "model_settled":settled,
