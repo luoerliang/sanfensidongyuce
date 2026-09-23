@@ -226,12 +226,17 @@ def tg_worker():
         a.add_handler(CommandHandler("id",cmd_id))
         a.add_handler(CommandHandler("status",cmd_status))
         a.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND,receive))
-        a.run_polling(allowed_updates=Update.ALL_TYPES,close_loop=False)
+        a.run_polling(allowed_updates=Update.ALL_TYPES, close_loop=False, stop_signals=None)
     except Exception as e:
         print(f"Telegram worker failed: {type(e).__name__}: {e}",flush=True)
 
-if __name__=="__main__":
+def boot():
     init_db()
     import_history_once()
-    threading.Thread(target=tg_worker,daemon=True).start()
-    app.run(host="0.0.0.0",port=PORT)
+    if BOT_TOKEN:
+        threading.Thread(target=tg_worker, daemon=True, name="telegram-worker").start()
+
+boot()
+
+if __name__=="__main__":
+    app.run(host="0.0.0.0", port=PORT)
