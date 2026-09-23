@@ -1,4 +1,4 @@
-import os, re, csv, sqlite3, threading, math, time, hashlib
+import os, re, csv, sqlite3, threading, math, time, hashlib, json
 from collections import Counter, defaultdict
 from flask import Flask, jsonify, render_template_string, request
 import requests
@@ -66,6 +66,25 @@ learner_cache = {
     "profiles": {},
     "settled": 0,
     "window": 60,
+    "updated_at": ""
+}
+
+AI_FEATURES = [
+    "bias","sp6","sp12","sp24","sp60","all12","all36","gap",
+    "transition","tail","longprior","wave","size","parity","head",
+    "cold","repeat","zodiac_pair"
+]
+ai_lock = threading.RLock()
+ai_state = {
+    "weights": [0.0] * len(AI_FEATURES),
+    "steps": 0,
+    "trained": 0,
+    "last_issue": "",
+    "lr": 0.08,
+    "ready": False,
+    "bootstrapping": False,
+    "historical_validation_n": 0,
+    "historical_hit24": 0.0,
     "updated_at": ""
 }
 
@@ -204,7 +223,7 @@ box-shadow:0 12px 30px #0007;opacity:0;pointer-events:none;transition:.2s;z-inde
     <div class="strategyGrid">
       <div class="strategyBox"><div class="strategyTitle">预测目标</div><div id="forecastTarget" class="strategyMain">--</div></div>
       <div class="strategyBox"><div class="strategyTitle">前瞻模型</div><div id="forecastMode" class="strategyMain">--</div></div>
-      <div class="strategyBox"><div class="strategyTitle">持续学习</div><div id="learningState" class="strategyMain">--</div></div>
+      <div class="strategyBox"><div class="strategyTitle">AI持续学习</div><div id="learningState" class="strategyMain">--</div></div>
       <div class="strategyBox"><div class="strategyTitle">60期校准</div><div id="learningProgress" class="strategyMain">--</div></div>
     </div>
   </section>
@@ -354,8 +373,9 @@ async function loadMain(){
     forecastTarget.textContent=fc.target_issue?`预测 ${fc.target_issue} 期`:'--';
     forecastMode.innerHTML=`${fc.mode||'前瞻预测'}<br>转移样本 ${fc.transition_samples??0} · 全历史 ${fc.long_prior_ready?'已缓存':'后台加载'}`;
     const lr=d.learning||{};
-    learningState.innerHTML=`当前：${lr.best_profile||d.profile||'平衡'}<br>24码实盘 ${lr.rate24??0}%`;
-    learningProgress.innerHTML=`已结算 ${lr.settled??0}/60 期<br>${(lr.settled??0)>=60?'60期滚动学习运行中':'继续积累真实预测'}`;
+    const ail=lr.ai_live||{};
+    learningState.innerHTML=`AI训练 ${lr.ai_trained??0} 次 · 融合 ${lr.ai_mix_pct??0}%<br>AI实盘24码 ${ail.hit24??0}% (${ail.n??0}/60)`;
+    learningProgress.innerHTML=`模型结算 ${lr.settled??0}/60 期<br>历史AI验证 ${lr.ai_history_hit24??0}% / ${lr.ai_history_n??0}期`;
     const sg=d.strategy||{};
     coldSignal.innerHTML=sg.cold_rebound_now?'冷反弹信号：启用<br>24码允许热+冷防守':'冷反弹信号：普通<br>仍以热码为主';
     coldZodiac.innerHTML=(sg.cold_zodiacs||[]).length?`偏冷：${sg.cold_zodiacs.join('、')}`:'暂无';
@@ -474,6 +494,20 @@ def init_db():
           score REAL DEFAULT 0.0,
           updated_at TEXT DEFAULT CURRENT_TIMESTAMP
         )""")
+        c.execute("""CREATE TABLE IF NOT EXISTS ai_model(
+          id INTEGER PRIMARY KEY CHECK(id=1),
+          weights TEXT NOT NULL,
+          steps INTEGER DEFAULT 0,
+          trained INTEGER DEFAULT 0,
+          last_issue TEXT,
+          lr REAL DEFAULT 0.08,
+          historical_validation_n INTEGER DEFAULT 0,
+          historical_hit24 REAL DEFAULT 0.0,
+          updated_at TEXT DEFAULT CURRENT_TIMESTAMP
+        )""")
+        c.execute("""INSERT OR IGNORE INTO ai_model
+          (id,weights,steps,trained,last_issue,lr)
+          VALUES (1,?,0,0,'',0.08)""",(json.dumps([0.0]*len(AI_FEATURES)),))
         for _p in ["趋势快","平衡","热码","结构","均衡覆盖"]:
             c.execute("INSERT OR IGNORE INTO learner_scores(profile,weight) VALUES (?,1.0)",(_p,))
         c.commit(); c.close()
@@ -682,7 +716,10 @@ def add_draw(issue,nums,zs,colors,raw):
             stats_cache["issue"]=None
             stats_cache["value"]=None
             _patch_live_cache_latest(issue, nums, zs)
-            threading.Thread(target=refresh_all_caches,daemon=True,name="cache-refresh").start()
+            def _learn_then_refresh():
+                train_ai_after_new_draw(issue, nums)
+                refresh_all_caches()
+            threading.Thread(target=_learn_then_refresh,daemon=True,name="ai-learn-and-refresh").start()
         return changed
 
 def all_rows():
@@ -1413,14 +1450,297 @@ def _norm_pool(values, pool):
         return {n:.5 for n in pool}
     return {n:(values.get(n,0.0)-lo)/(hi-lo) for n in pool}
 
+
+def load_ai_state():
+    with db_lock:
+        c=connect()
+        try:
+            row=c.execute("SELECT * FROM ai_model WHERE id=1").fetchone()
+        finally:
+            c.close()
+    if not row:
+        return
+    try:
+        w=json.loads(row["weights"] or "[]")
+        if len(w)!=len(AI_FEATURES):
+            w=[0.0]*len(AI_FEATURES)
+    except Exception:
+        w=[0.0]*len(AI_FEATURES)
+    with ai_lock:
+        ai_state["weights"]=[float(x) for x in w]
+        ai_state["steps"]=int(row["steps"] or 0)
+        ai_state["trained"]=int(row["trained"] or 0)
+        ai_state["last_issue"]=str(row["last_issue"] or "")
+        ai_state["lr"]=float(row["lr"] or .08)
+        ai_state["ready"]=ai_state["trained"]>0
+        ai_state["historical_validation_n"]=int(row["historical_validation_n"] or 0)
+        ai_state["historical_hit24"]=float(row["historical_hit24"] or 0.0)
+        ai_state["updated_at"]=str(row["updated_at"] or "")
+
+def save_ai_state():
+    with ai_lock:
+        payload=(
+            json.dumps(ai_state["weights"],separators=(",",":")),
+            int(ai_state["steps"]),int(ai_state["trained"]),
+            str(ai_state["last_issue"]),float(ai_state["lr"]),
+            int(ai_state["historical_validation_n"]),
+            float(ai_state["historical_hit24"])
+        )
+    with db_lock:
+        c=connect()
+        try:
+            c.execute("""UPDATE ai_model SET
+              weights=?,steps=?,trained=?,last_issue=?,lr=?,
+              historical_validation_n=?,historical_hit24=?,
+              updated_at=CURRENT_TIMESTAMP WHERE id=1""",payload)
+            c.commit()
+        finally:
+            c.close()
+
+def _safe_ratio(v, denom):
+    return float(v)/float(denom) if denom else 0.0
+
+def _ai_feature_matrix(r):
+    """49 candidate feature vectors built only from information available before target draw."""
+    if not r:
+        return {n:[1.0]+[0.0]*(len(AI_FEATURES)-1) for n in range(1,50)}
+
+    # Special-number frequencies
+    spc={}
+    for h in (6,12,24,60):
+        spc[h]=Counter(x["special"] for x in r[:min(h,len(r))])
+
+    # All-seven-number frequencies
+    all12=Counter()
+    all36=Counter()
+    for x in r[:min(12,len(r))]:
+        for j in range(1,7): all12[x[f"n{j}"]]+=1
+        all12[x["special"]]+=1
+    for x in r[:min(36,len(r))]:
+        for j in range(1,7): all36[x[f"n{j}"]]+=1
+        all36[x["special"]]+=1
+
+    # Gap / coldness
+    num_cold,_zcold,num_gap,_zgap=_cold_metrics(r)
+
+    # Forward transition features
+    num_t,_z_t,_head_t,_wave_t,_size_t,_par_t,_meta=_forward_transition_scores(r)
+    tail_t=_tail_transition_score(r)
+    long_num,_long_z,long_ready=_long_prior_bonus(r)
+    trend=_trend_profiles(r)
+    head_ctx=_head_trend(r)
+
+    # Within-zodiac stabilized history
+    zmap=_number_zodiac_map(r)
+    pair=_within_zodiac_pair_bonus(r,zmap)
+    pair_norm={}
+    for z in ALL_ZODIACS:
+        pool=[n for n in range(1,50) if zmap.get(n)==z]
+        pair_norm.update(_norm_pool(pair,pool))
+
+    latest=r[0]["special"]
+    head_strength=head_ctx.get("strength",{})
+
+    X={}
+    for n in range(1,50):
+        gap=min(num_gap.get(n,0),60)/60.0
+        X[n]=[
+          1.0,
+          _safe_ratio(spc[6][n],6),
+          _safe_ratio(spc[12][n],12),
+          _safe_ratio(spc[24][n],24),
+          _safe_ratio(spc[60][n],60),
+          _safe_ratio(all12[n],12*7),
+          _safe_ratio(all36[n],36*7),
+          gap,
+          float(num_t[n]),
+          float(tail_t[n]),
+          float(long_num[n] if long_ready else .5),
+          float(trend["wave"].get(wave_of(n),1/3)),
+          float(trend["size"].get(size_of(n),.5)),
+          float(trend["parity"].get(parity_of(n),.5)),
+          float(head_strength.get(head_of(n),1.0)/2.0),
+          float(num_cold.get(n,0.0)),
+          1.0 if n==latest else 0.0,
+          float(pair_norm.get(n,.5))
+        ]
+    return X
+
+def _ai_logits_and_probs(r, weights=None):
+    X=_ai_feature_matrix(r)
+    with ai_lock:
+        w=list(ai_state["weights"] if weights is None else weights)
+    logits={}
+    for n in range(1,50):
+        x=X[n]
+        logits[n]=sum(a*b for a,b in zip(w,x))
+    mx=max(logits.values())
+    ex={n:math.exp(max(-30,min(30,logits[n]-mx))) for n in logits}
+    z=sum(ex.values()) or 1.0
+    probs={n:ex[n]/z for n in ex}
+    return X,logits,probs
+
+def _normalize_ai_probs(probs):
+    vals=list(probs.values())
+    lo=min(vals); hi=max(vals)
+    if hi-lo<1e-12:
+        return {n:.5 for n in probs}
+    return {n:(v-lo)/(hi-lo) for n,v in probs.items()}
+
+def ai_train_one(state_rows, actual_special, issue="", persist=True):
+    """Online softmax ranker: predict 1-of-49, then update by cross-entropy gradient."""
+    if not state_rows:
+        return
+    X,_logits,probs=_ai_logits_and_probs(state_rows)
+    y=int(actual_special)
+    with ai_lock:
+        w=list(ai_state["weights"])
+        steps=int(ai_state["steps"])
+        base_lr=float(ai_state["lr"])
+    lr=base_lr/math.sqrt(1.0+steps/50.0)
+
+    expected=[0.0]*len(AI_FEATURES)
+    for n,p in probs.items():
+        for j,v in enumerate(X[n]):
+            expected[j]+=p*v
+    grad=[X[y][j]-expected[j] for j in range(len(AI_FEATURES))]
+
+    # L2 shrink + clipping for stability.
+    for j in range(len(w)):
+        w[j]=(1.0-0.0008*lr)*w[j] + lr*grad[j]
+        w[j]=max(-6.0,min(6.0,w[j]))
+
+    with ai_lock:
+        ai_state["weights"]=w
+        ai_state["steps"]=steps+1
+        ai_state["trained"]=int(ai_state["trained"])+1
+        ai_state["last_issue"]=str(issue or "")
+        ai_state["ready"]=True
+        ai_state["updated_at"]=time.strftime("%Y-%m-%d %H:%M:%S")
+    if persist:
+        save_ai_state()
+
+def ai_live_validation_stats(window=60):
+    """AI's own locked pre-draw predictions from prediction_log profile=AI在线."""
+    with db_lock:
+        c=connect()
+        try:
+            rows=c.execute("""SELECT hit24,hitmain,hitz,hitping
+                              FROM prediction_log
+                              WHERE profile='AI在线' AND settled=1
+                              ORDER BY CAST(target_issue AS INTEGER) DESC
+                              LIMIT ?""",(window,)).fetchall()
+        finally:
+            c.close()
+    n=len(rows)
+    if not n:
+        return {"n":0,"hit24":0.0,"hitMain":0.0,"hitZ":0.0,"hitPingte":0.0}
+    h24=sum(int(x["hit24"] or 0) for x in rows)
+    hm=sum(int(x["hitmain"] or 0) for x in rows)
+    hz=sum(int(x["hitz"] or 0) for x in rows)
+    hp=sum(int(x["hitping"] or 0) for x in rows)
+    return {
+      "n":n,
+      "hit24":round(100*h24/n,1),
+      "hitMain":round(100*hm/n,1),
+      "hitZ":round(100*hz/n,1),
+      "hitPingte":round(100*hp/n,1)
+    }
+
+def bootstrap_ai_history():
+    """Background pretraining + 60-issue walk-forward validation.
+    Uses only older data for each prediction; latest 60 are never used to train before prediction."""
+    with ai_lock:
+        if ai_state["bootstrapping"] or ai_state["trained"]>=60:
+            return
+        ai_state["bootstrapping"]=True
+
+    t0=time.time()
+    try:
+        rows=recent_rows(520)
+        if len(rows)<260:
+            return
+
+        # Start from fresh weights only when no inherited AI exists.
+        with ai_lock:
+            inherited=ai_state["trained"]>0
+        if inherited:
+            return
+
+        # Train on older 120 transitions, ending before the 60-validation block.
+        train_start=min(len(rows)-2,240)
+        train_end=60
+        for k in range(train_start,train_end,-1):
+            state=rows[k+1:]
+            if len(state)<100:
+                continue
+            ai_train_one(state,rows[k]["special"],rows[k]["issue"],persist=False)
+
+        # Prequential validation over the latest 60:
+        # predict each issue using only older rows, then learn from that issue.
+        hits=0
+        tested=0
+        for k in range(59,-1,-1):
+            state=rows[k+1:]
+            if len(state)<120:
+                continue
+            zmap=_number_zodiac_map(state)
+            _X,_lg,probs=_ai_logits_and_probs(state)
+            pools={z:[] for z in ALL_ZODIACS}
+            for n in range(1,50):
+                z=zmap.get(n)
+                if z in pools:
+                    pools[z].append(n)
+            cand=[]
+            for z in ALL_ZODIACS:
+                cand += sorted(pools[z],key=lambda n:(-probs.get(n,0.0),n))[:2]
+            cand=list(dict.fromkeys(cand))[:24]
+            hits += int(rows[k]["special"] in cand)
+            tested += 1
+            ai_train_one(state,rows[k]["special"],rows[k]["issue"],persist=False)
+
+        with ai_lock:
+            ai_state["historical_validation_n"]=tested
+            ai_state["historical_hit24"]=round(100*hits/tested,1) if tested else 0.0
+        save_ai_state()
+        print(f"[AI] bootstrap trained={ai_state['trained']} validation={tested} hit24={ai_state['historical_hit24']}% in {time.time()-t0:.2f}s",flush=True)
+    except Exception as e:
+        print(f"[AI] bootstrap failed: {type(e).__name__}: {e}",flush=True)
+    finally:
+        with ai_lock:
+            ai_state["bootstrapping"]=False
+
+def train_ai_after_new_draw(issue, nums):
+    """Use the state that existed immediately before the new draw."""
+    try:
+        rows=recent_rows(800)
+        if not rows or str(rows[0]["issue"])!=str(issue):
+            return
+        state=rows[1:]
+        ai_train_one(state,int(nums[6]),str(issue),persist=True)
+        print(f"[AI] online update issue={issue} trained={ai_state['trained']}",flush=True)
+    except Exception as e:
+        print(f"[AI] online update failed: {type(e).__name__}: {e}",flush=True)
+
 def _candidate24_by_zodiac(r, profile):
     """Exactly 24 = 12 zodiacs × 2 codes.
-    Within each zodiac, combine next-issue score with a stabilized historical
-    2-of-zodiac selector. This targets the actual 24-code hit rate directly."""
+    Hybrid ranking: statistical forecast + stabilized zodiac pair history + online AI."""
     zmap=_number_zodiac_map(r)
     ctx=_strategy_context(r)
     ns,transition_meta,ztrans=_predictive_number_scores(r,profile,ctx)
     pair_bonus=_within_zodiac_pair_bonus(r,zmap)
+
+    with ai_lock:
+        ai_trained=int(ai_state["trained"])
+        ai_ready=bool(ai_state["ready"])
+    if ai_ready:
+        _X,_lg,ai_probs=_ai_logits_and_probs(r)
+        ai_norm=_normalize_ai_probs(ai_probs)
+        maturity=min(1.0,ai_trained/60.0)
+        ai_mix=0.18+0.32*maturity   # 18% early -> 50% after 60+ updates
+    else:
+        ai_norm={n:.5 for n in range(1,50)}
+        ai_mix=0.0
 
     pools={z:[] for z in ALL_ZODIACS}
     for n in range(1,50):
@@ -1433,19 +1753,15 @@ def _candidate24_by_zodiac(r, profile):
         pool=pools[z]
         ns_norm=_norm_pool(ns,pool)
         pair_norm=_norm_pool(pair_bonus,pool)
-
         combined={}
         for n in pool:
-            # Live forecast remains the driver; stabilized within-zodiac history
-            # prevents the two chosen numbers from flipping on one noisy issue.
-            combined[n]=.66*ns_norm.get(n,.5)+.34*pair_norm.get(n,.5)
-
+            base=.66*ns_norm.get(n,.5)+.34*pair_norm.get(n,.5)
+            combined[n]=(1-ai_mix)*base + ai_mix*ai_norm.get(n,.5)
             if ctx["cold_rebound_now"]:
-                combined[n]+=.08*ctx["num_cold"].get(n,0)
+                combined[n]+=.06*ctx["num_cold"].get(n,0)
 
         ranked=sorted(pool,key=lambda n:(-combined.get(n,-1e9),-ns.get(n,-1e9),n))
         codes=ranked[:2]
-
         groups.append({"zodiac":z,"codes":codes})
         for n in codes:
             if n not in used:
@@ -1457,6 +1773,11 @@ def _candidate24_by_zodiac(r, profile):
                 selected.append(n); used.add(n)
             if len(selected)>=24:
                 break
+
+    transition_meta=dict(transition_meta)
+    transition_meta["ai_ready"]=ai_ready
+    transition_meta["ai_trained"]=ai_trained
+    transition_meta["ai_mix_pct"]=round(ai_mix*100,1)
 
     return selected[:24],groups,ns,_zodiac_scores_profile(r,profile),ctx,transition_meta,ztrans
 
@@ -1709,6 +2030,20 @@ def record_shadow_predictions(r):
         except Exception as e:
             print(f"[LEARN] shadow {profile} failed: {type(e).__name__}: {e}",flush=True)
 
+    # Also lock the actual AI-hybrid forecast for honest future validation.
+    try:
+        best_profile,_=_select_profile(r)
+        c24,m4,z4,_,_=_predict_with_profile(r,best_profile)
+        records.append((
+            target,"AI在线",
+            ",".join(str(n) for n in c24),
+            ",".join(str(n) for n in m4),
+            ",".join(z4),
+            py
+        ))
+    except Exception as e:
+        print(f"[AI] locked prediction failed: {type(e).__name__}: {e}",flush=True)
+
     if records:
         with db_lock:
             c=connect()
@@ -1749,14 +2084,17 @@ def export_learning_payload(limit=1000):
             rows=c.execute("""SELECT * FROM prediction_log
                               ORDER BY CAST(target_issue AS INTEGER) DESC, profile
                               LIMIT ?""",(int(limit),)).fetchall()
-            return {"logs":[{k:x[k] for k in x.keys()} for x in rows]}
+            airow=c.execute("SELECT * FROM ai_model WHERE id=1").fetchone()
+            return {
+              "logs":[{k:x[k] for k in x.keys()} for x in rows],
+              "ai":({k:airow[k] for k in airow.keys()} if airow else None)
+            }
         finally:
             c.close()
 
 def import_learning_payload(payload):
     logs=payload.get("logs",[]) if isinstance(payload,dict) else []
-    if not logs:
-        return 0
+    ai_payload=payload.get("ai") if isinstance(payload,dict) else None
     inserted=0
     with db_lock:
         c=connect()
@@ -1778,6 +2116,30 @@ def import_learning_payload(payload):
             c.commit()
         finally:
             c.close()
+    if ai_payload:
+        try:
+            weights=str(ai_payload.get("weights") or "[]")
+            parsed=json.loads(weights)
+            if len(parsed)==len(AI_FEATURES):
+                with db_lock:
+                    c=connect()
+                    try:
+                        c.execute("""UPDATE ai_model SET weights=?,steps=?,trained=?,
+                                     last_issue=?,lr=?,historical_validation_n=?,
+                                     historical_hit24=?,updated_at=CURRENT_TIMESTAMP
+                                     WHERE id=1""",
+                                  (weights,int(ai_payload.get("steps") or 0),
+                                   int(ai_payload.get("trained") or 0),
+                                   str(ai_payload.get("last_issue") or ""),
+                                   float(ai_payload.get("lr") or .08),
+                                   int(ai_payload.get("historical_validation_n") or 0),
+                                   float(ai_payload.get("historical_hit24") or 0.0)))
+                        c.commit()
+                    finally:
+                        c.close()
+                load_ai_state()
+        except Exception as e:
+            print(f"[AI] inherited state failed: {e}",flush=True)
     refresh_learner_cache(60)
     return inserted
 
@@ -2012,6 +2374,12 @@ def build_model():
         "settled":learner_cache.get("settled",0),
         "target":60,
         "rate24":(learner_cache.get("profiles",{}).get(learner_cache.get("best_profile","平衡"),{}) or {}).get("rate24",0.0),
+        "ai_trained":ai_state.get("trained",0),
+        "ai_ready":ai_state.get("ready",False),
+        "ai_mix_pct":transition_meta.get("ai_mix_pct",0.0),
+        "ai_history_n":ai_state.get("historical_validation_n",0),
+        "ai_history_hit24":ai_state.get("historical_hit24",0.0),
+        "ai_live":ai_live_validation_stats(60),
         "updated_at":learner_cache.get("updated_at","")
       },
       "forecast":{
@@ -2333,6 +2701,7 @@ def boot():
 
     # From v26 onward, also inherit learned prediction/score history.
     sync_previous_learning()
+    load_ai_state()
     refresh_learner_cache(60)
 
     # Make the site usable immediately. Do NOT wait for model/backtest here.
@@ -2350,6 +2719,7 @@ def boot():
     # Live model first, then full-history prior in parallel. Neither blocks the site.
     threading.Thread(target=rebuild_live_cache,daemon=True,name="initial-model-build").start()
     threading.Thread(target=build_long_prior,daemon=True,name="full-history-prior").start()
+    threading.Thread(target=bootstrap_ai_history,daemon=True,name="ai-history-bootstrap").start()
 
 boot()
 
