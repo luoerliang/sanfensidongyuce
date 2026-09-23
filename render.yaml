@@ -1,0 +1,16 @@
+services:
+  - type: web
+    name: sanfen-tg-bot
+    runtime: docker
+    plan: free
+    envVars:
+      - key: BOT_TOKEN
+        sync: false
+      - key: ALLOWED_CHAT_ID
+        sync: false
+      - key: DB_PATH
+        value: /var/data/history.db
+    disk:
+      name: sanfen-data
+      mountPath: /var/data
+      sizeGB: 1
