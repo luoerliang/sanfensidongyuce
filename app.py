@@ -1,13 +1,22 @@
-import os, re, csv, sqlite3, threading, math, time
+import os, re, csv, sqlite3, threading, math, time, hashlib
 from collections import Counter, defaultdict
 from flask import Flask, jsonify, render_template_string, request
-from telegram import Update
-from telegram.ext import ApplicationBuilder, MessageHandler, CommandHandler, ContextTypes, filters
+import requests
 
 DB = os.getenv("DB_PATH", "history.db")
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 ALLOWED_CHAT_ID = os.getenv("ALLOWED_CHAT_ID", "").strip()
 PORT = int(os.getenv("PORT", "10000"))
+RENDER_SERVICE_NAME = os.getenv("RENDER_SERVICE_NAME", "").strip()
+RENDER_EXTERNAL_URL = os.getenv("RENDER_EXTERNAL_URL", "").rstrip("/")
+WEBHOOK_BASE_URL = os.getenv("WEBHOOK_BASE_URL", "").rstrip("/")
+if not WEBHOOK_BASE_URL:
+    WEBHOOK_BASE_URL = RENDER_EXTERNAL_URL
+if not WEBHOOK_BASE_URL and RENDER_SERVICE_NAME:
+    WEBHOOK_BASE_URL = f"https://{RENDER_SERVICE_NAME}.onrender.com"
+WEBHOOK_PATH = "/telegram/webhook"
+WEBHOOK_SECRET = hashlib.sha256(BOT_TOKEN.encode("utf-8")).hexdigest()[:48] if BOT_TOKEN else ""
+TG_API = f"https://api.telegram.org/bot{BOT_TOKEN}" if BOT_TOKEN else ""
 
 app = Flask(__name__)
 db_lock = threading.Lock()
@@ -524,7 +533,7 @@ def home():
 
 @app.get("/api/health")
 def health():
-    return jsonify({"ok":True,"db":DB,"telegram":bool(BOT_TOKEN),"count":len(all_rows())})
+    return jsonify({"ok":True,"db":DB,"telegram":bool(BOT_TOKEN),"telegram_mode":"webhook","webhook_base":WEBHOOK_BASE_URL,"count":len(all_rows())})
 
 @app.get("/api/prediction")
 def prediction():
@@ -549,63 +558,124 @@ def history():
         })
     return jsonify({"total":total,"items":items})
 
-async def cmd_id(update:Update,context:ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(f"Chat ID: {update.effective_chat.id}")
-
-async def cmd_status(update:Update,context:ContextTypes.DEFAULT_TYPE):
-    m=model()
-    await update.message.reply_text(f"运行正常\\n历史期数: {m['count']}\\n最新期号: {m['issue']}")
-
-async def receive(update:Update,context:ContextTypes.DEFAULT_TYPE):
-    if not update.message or not update.message.text:
-        return
-    sender=update.effective_user
-    sender_name=(sender.username if sender else None) or (sender.full_name if sender else "unknown")
-    sender_is_bot=bool(getattr(sender,"is_bot",False)) if sender else False
-    print(f"[TG] chat={update.effective_chat.id} sender={sender_name} is_bot={sender_is_bot} text={update.message.text[:160]!r}",flush=True)
-
-    if ALLOWED_CHAT_ID and str(update.effective_chat.id)!=ALLOWED_CHAT_ID:
-        print(f"[TG] ignored: chat id does not match ALLOWED_CHAT_ID={ALLOWED_CHAT_ID}",flush=True)
-        return
-
-    p=parse_draw(update.message.text)
-    if not p:
-        print("[TG] received but parser did not recognize a complete draw",flush=True)
-        return
-    issue,nums,zs,colors=p
-    print(f"[TG] parsed issue={issue} nums={nums} zodiac={zs} colors={colors}",flush=True)
-    if add_draw(issue,nums,zs,colors,update.message.text):
-        print(f"[TG] inserted issue={issue}",flush=True)
-        # 机器人开奖消息不回复，避免群内刷屏和 Flood control。
-        if not sender_is_bot:
-            try:
-                await update.message.reply_text(f"已入库 {issue}，统计结果已更新。")
-            except Exception as e:
-                print(f"[TG] inserted but reply failed: {type(e).__name__}: {e}",flush=True)
-    else:
-        print(f"[TG] duplicate/invalid issue={issue}, not inserted",flush=True)
-
-async def post_init(application):
-    await application.bot.delete_webhook(drop_pending_updates=False)
-
-def tg_worker():
+def tg_send(chat_id, text, reply_to_message_id=None):
     if not BOT_TOKEN:
-        print("BOT_TOKEN not configured; web service will still run.",flush=True)
-        return
+        return False
+    payload={"chat_id":chat_id,"text":text}
+    if reply_to_message_id:
+        payload["reply_to_message_id"]=reply_to_message_id
     try:
-        a=ApplicationBuilder().token(BOT_TOKEN).post_init(post_init).build()
-        a.add_handler(CommandHandler("id",cmd_id))
-        a.add_handler(CommandHandler("status",cmd_status))
-        a.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND,receive))
-        a.run_polling(allowed_updates=Update.ALL_TYPES,close_loop=False,stop_signals=None)
+        r=requests.post(f"{TG_API}/sendMessage",json=payload,timeout=12)
+        if not r.ok:
+            print(f"[TG] sendMessage failed {r.status_code}: {r.text[:300]}",flush=True)
+        return r.ok
     except Exception as e:
-        print(f"Telegram worker failed: {type(e).__name__}: {e}",flush=True)
+        print(f"[TG] sendMessage exception: {type(e).__name__}: {e}",flush=True)
+        return False
+
+def set_telegram_webhook():
+    if not BOT_TOKEN:
+        print("[TG] BOT_TOKEN not configured; webhook disabled",flush=True)
+        return False
+    if not WEBHOOK_BASE_URL:
+        print("[TG] no public webhook URL detected; set WEBHOOK_BASE_URL manually",flush=True)
+        return False
+    url=f"{WEBHOOK_BASE_URL}{WEBHOOK_PATH}"
+    payload={
+        "url":url,
+        "secret_token":WEBHOOK_SECRET,
+        "allowed_updates":["message"],
+        "drop_pending_updates":False,
+        "max_connections":20
+    }
+    try:
+        r=requests.post(f"{TG_API}/setWebhook",json=payload,timeout=15)
+        print(f"[TG] setWebhook url={url} -> {r.status_code} {r.text[:400]}",flush=True)
+        return r.ok
+    except Exception as e:
+        print(f"[TG] setWebhook exception: {type(e).__name__}: {e}",flush=True)
+        return False
+
+def webhook_keeper():
+    # Re-assert webhook during deploy overlap, then every 10 minutes.
+    for delay in (0,8,20,40):
+        if delay:
+            time.sleep(delay)
+        set_telegram_webhook()
+    while True:
+        time.sleep(600)
+        set_telegram_webhook()
+
+def process_telegram_message(msg):
+    text=msg.get("text") or ""
+    chat=msg.get("chat") or {}
+    sender=msg.get("from") or {}
+    chat_id=chat.get("id")
+    message_id=msg.get("message_id")
+    sender_name=sender.get("username") or " ".join(
+        x for x in [sender.get("first_name"),sender.get("last_name")] if x
+    ) or "unknown"
+    sender_is_bot=bool(sender.get("is_bot"))
+    print(f"[TG-WEBHOOK] chat={chat_id} sender={sender_name} is_bot={sender_is_bot} text={text[:160]!r}",flush=True)
+
+    # Commands remain available for setup/testing.
+    cmd=(text.strip().split()[0].split("@")[0].lower() if text.strip().startswith("/") else "")
+    if cmd=="/id":
+        tg_send(chat_id,f"Chat ID: {chat_id}",message_id)
+        return
+    if cmd=="/status":
+        m=model()
+        tg_send(chat_id,f"运行正常\\n历史期数: {m['count']}\\n最新期号: {m['issue']}",message_id)
+        return
+
+    if ALLOWED_CHAT_ID and str(chat_id)!=ALLOWED_CHAT_ID:
+        print(f"[TG-WEBHOOK] ignored: chat id does not match ALLOWED_CHAT_ID={ALLOWED_CHAT_ID}",flush=True)
+        return
+
+    p=parse_draw(text)
+    if not p:
+        print("[TG-WEBHOOK] message received but parser did not recognize a complete draw",flush=True)
+        return
+
+    issue,nums,zs,colors=p
+    print(f"[TG-WEBHOOK] parsed issue={issue} nums={nums} zodiac={zs} colors={colors}",flush=True)
+    if add_draw(issue,nums,zs,colors,text):
+        print(f"[TG-WEBHOOK] inserted issue={issue}",flush=True)
+        # Official bot messages are never auto-replied to, avoiding bot loops/flood control.
+        if not sender_is_bot:
+            tg_send(chat_id,f"已入库 {issue}，统计结果已更新。",message_id)
+    else:
+        print(f"[TG-WEBHOOK] duplicate/invalid issue={issue}, not inserted",flush=True)
+
+@app.post(WEBHOOK_PATH)
+def telegram_webhook():
+    if WEBHOOK_SECRET:
+        got=request.headers.get("X-Telegram-Bot-Api-Secret-Token","")
+        if got!=WEBHOOK_SECRET:
+            return jsonify({"ok":False,"error":"bad secret"}),403
+    data=request.get_json(silent=True) or {}
+    msg=data.get("message")
+    if msg:
+        process_telegram_message(msg)
+    return jsonify({"ok":True})
+
+@app.get("/api/webhook")
+def webhook_status():
+    if not BOT_TOKEN:
+        return jsonify({"ok":False,"configured":False})
+    try:
+        r=requests.get(f"{TG_API}/getWebhookInfo",timeout=10)
+        payload=r.json()
+        payload["_detected_base_url"]=WEBHOOK_BASE_URL
+        return jsonify(payload)
+    except Exception as e:
+        return jsonify({"ok":False,"error":str(e)}),500
 
 def boot():
     init_db()
     import_history_once()
     if BOT_TOKEN:
-        threading.Thread(target=tg_worker,daemon=True,name="telegram-worker").start()
+        threading.Thread(target=webhook_keeper,daemon=True,name="telegram-webhook-keeper").start()
 
 boot()
 

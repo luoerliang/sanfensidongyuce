@@ -1,46 +1,31 @@
-# 三分六合彩 Webhook稳定版 v10
+# 三分六合彩 Webhook修复版 v11
 
-## 为什么改成 Webhook
-v9 以前使用 Telegram `getUpdates` 长轮询。
-Render 支持零停机部署，部署新版本时新旧实例可能短暂并存，
-两个实例同时 `getUpdates` 就会出现：
+修复你截图中的：
+`ModuleNotFoundError: No module named 'telegram'`
 
-`telegram.error.Conflict: terminated by other getUpdates request`
+原因：上一版 Webhook 改造时旧的 `from telegram import Update` 仍残留在 app.py，
+但 requirements 已经移除了 python-telegram-bot。
 
-v10 完全移除 long polling，改用 Telegram Webhook。
-Telegram 官方规定 getUpdates 与 webhook 是互斥的；Webhook 模式不会有两个实例抢 getUpdates 的冲突。
+v11 已彻底删除 python-telegram-bot 和所有 long polling / getUpdates 代码，
+只使用 `requests + Telegram Bot API Webhook`。
 
-Render 会自动提供 `RENDER_EXTERNAL_URL`，程序自动设置：
-`https://你的服务.onrender.com/telegram/webhook`
+## 部署后正常日志
+应看到：
+`[TG] setWebhook url=https://...onrender.com/telegram/webhook -> 200 ...`
 
-并使用 Telegram `secret_token` 校验 webhook 请求。
-
-## 保留全部功能
-- 官方开奖机器人消息自动入库
-- 自适应动态换22码
-- 22码一键复制
-- 4肖4码同屏
-- 最新开奖结果
-- 红/蓝/绿号码颜色
-- 近60期滚动回测命中率/错误率
-- 历史列表在最下面可手滑滚动
-- /id
-- /status
-- 波色不参与特码/4码评分
-
-## Render 环境变量
-BOT_TOKEN = 当前新 Token
-ALLOWED_CHAT_ID = -5560268424
-DB_PATH = history.db
-
-不需要填写 Webhook URL。Render 自动提供 `RENDER_EXTERNAL_URL`。
-
-## 部署后
-日志应该看到：
-`[TG] setWebhook -> 200 ... "Webhook was set"`
-
-之后新期开奖会看到：
+收到开奖：
 `[TG-WEBHOOK] parsed issue=...`
 `[TG-WEBHOOK] inserted issue=...`
 
-可访问 `/api/webhook` 查看 Telegram webhook 当前状态。
+## Render 环境变量
+BOT_TOKEN = 当前 Token
+ALLOWED_CHAT_ID = -5560268424
+DB_PATH = history.db
+
+一般不需要 WEBHOOK_BASE_URL。
+程序优先读取 Render 自动变量，识别失败时才手动填：
+`WEBHOOK_BASE_URL=https://你的服务名.onrender.com`
+
+## 保留功能
+自适应动态换码、22码一键复制、4肖4码同屏、开奖结果、红蓝绿号码、
+近60期回测命中率/错误率、历史滚动、/id、/status。
