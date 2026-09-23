@@ -59,6 +59,16 @@ sync_state = {"source": HISTORY_SOURCE_URL, "imported": 0, "last_error": "", "la
 app = Flask(__name__)
 db_lock = threading.RLock()
 stats_cache = {"issue": None, "value": None}
+learner_lock = threading.RLock()
+learner_cache = {
+    "ready": False,
+    "best_profile": "平衡",
+    "profiles": {},
+    "settled": 0,
+    "window": 60,
+    "updated_at": ""
+}
+
 
 RED_NUMS = {1,2,7,8,12,13,18,19,23,24,29,30,34,35,40,45,46}
 BLUE_NUMS = {3,4,9,10,14,15,20,25,26,31,36,37,41,42,47,48}
@@ -194,6 +204,8 @@ box-shadow:0 12px 30px #0007;opacity:0;pointer-events:none;transition:.2s;z-inde
     <div class="strategyGrid">
       <div class="strategyBox"><div class="strategyTitle">预测目标</div><div id="forecastTarget" class="strategyMain">--</div></div>
       <div class="strategyBox"><div class="strategyTitle">前瞻模型</div><div id="forecastMode" class="strategyMain">--</div></div>
+      <div class="strategyBox"><div class="strategyTitle">持续学习</div><div id="learningState" class="strategyMain">--</div></div>
+      <div class="strategyBox"><div class="strategyTitle">60期校准</div><div id="learningProgress" class="strategyMain">--</div></div>
     </div>
   </section>
 
@@ -209,7 +221,7 @@ box-shadow:0 12px 30px #0007;opacity:0;pointer-events:none;transition:.2s;z-inde
     <div class="pillrow" style="margin-top:10px">
       <span class="pill">12肖分层覆盖</span>
       <span class="pill">趋势加速度</span>
-      <span class="pill">每肖1–3码</span>
+      <span class="pill">每肖固定2码</span>
       <span class="pill">自动校准模型</span>
     </div>
   </section>
@@ -341,6 +353,9 @@ async function loadMain(){
     const fc=d.forecast||{};
     forecastTarget.textContent=fc.target_issue?`预测 ${fc.target_issue} 期`:'--';
     forecastMode.innerHTML=`${fc.mode||'前瞻预测'}<br>转移样本 ${fc.transition_samples??0} · 全历史 ${fc.long_prior_ready?'已缓存':'后台加载'}`;
+    const lr=d.learning||{};
+    learningState.innerHTML=`当前：${lr.best_profile||d.profile||'平衡'}<br>24码实盘 ${lr.rate24??0}%`;
+    learningProgress.innerHTML=`已结算 ${lr.settled??0}/60 期<br>${(lr.settled??0)>=60?'60期滚动学习运行中':'继续积累真实预测'}`;
     const sg=d.strategy||{};
     coldSignal.innerHTML=sg.cold_rebound_now?'冷反弹信号：启用<br>24码允许热+冷防守':'冷反弹信号：普通<br>仍以热码为主';
     coldZodiac.innerHTML=(sg.cold_zodiacs||[]).length?`偏冷：${sg.cold_zodiacs.join('、')}`:'暂无';
@@ -359,7 +374,7 @@ async function loadStats(){
   try{
     const r=await fetch('/api/stats?_='+Date.now(),{cache:'no-store'});
     const st=await r.json();
-    statsHint.textContent=st.building?'后台计算中':`验证 ${st.n??0} 期 · 24码随机覆盖基线约49%`;
+    statsHint.textContent=`持续学习实盘验证 ${st.n??0}/60 期 · 只统计开奖前保存的预测`;
     if(st.building){
       hit22.textContent='计算中'; err22.textContent='';
       hit4.textContent='计算中'; err4.textContent='';
@@ -430,6 +445,37 @@ def init_db():
           z1 TEXT,z2 TEXT,z3 TEXT,z4 TEXT,z5 TEXT,z6 TEXT,z7 TEXT,
           c1 TEXT,c2 TEXT,c3 TEXT,c4 TEXT,c5 TEXT,c6 TEXT,c7 TEXT,
           raw TEXT, created_at TEXT DEFAULT CURRENT_TIMESTAMP)""")
+
+        c.execute("""CREATE TABLE IF NOT EXISTS prediction_log(
+          target_issue TEXT NOT NULL,
+          profile TEXT NOT NULL,
+          special24 TEXT NOT NULL,
+          main4 TEXT NOT NULL,
+          zodiac4 TEXT NOT NULL,
+          pingte TEXT,
+          created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+          settled INTEGER DEFAULT 0,
+          hit24 INTEGER,
+          hitmain INTEGER,
+          hitz INTEGER,
+          hitping INTEGER,
+          actual_special INTEGER,
+          actual_zodiac TEXT,
+          PRIMARY KEY(target_issue,profile)
+        )""")
+        c.execute("""CREATE TABLE IF NOT EXISTS learner_scores(
+          profile TEXT PRIMARY KEY,
+          weight REAL DEFAULT 1.0,
+          n INTEGER DEFAULT 0,
+          hit24 INTEGER DEFAULT 0,
+          hitmain INTEGER DEFAULT 0,
+          hitz INTEGER DEFAULT 0,
+          hitping INTEGER DEFAULT 0,
+          score REAL DEFAULT 0.0,
+          updated_at TEXT DEFAULT CURRENT_TIMESTAMP
+        )""")
+        for _p in ["趋势快","平衡","热码","结构","均衡覆盖"]:
+            c.execute("INSERT OR IGNORE INTO learner_scores(profile,weight) VALUES (?,1.0)",(_p,))
         c.commit(); c.close()
 
 def normalize_z(z):
@@ -632,6 +678,7 @@ def add_draw(issue,nums,zs,colors,raw):
         c.close()
         if changed:
             update_long_prior_incremental(prev_before_insert, nums, zs)
+            settle_predictions(issue, nums, zs)
             stats_cache["issue"]=None
             stats_cache["value"]=None
             _patch_live_cache_latest(issue, nums, zs)
@@ -1530,6 +1577,232 @@ def _predict_pingte_yixiao(r):
     one=ranked[0] if ranked else ""
     return one,meta
 
+
+def _csv_nums(text):
+    out=[]
+    for x in str(text or "").split(","):
+        x=x.strip()
+        if x.isdigit():
+            out.append(int(x))
+    return out
+
+def _csv_text(text):
+    return [x for x in str(text or "").split(",") if x]
+
+def refresh_learner_cache(window=60):
+    """Use only forecasts that were saved before their outcomes were known."""
+    result={}
+    with db_lock:
+        c=connect()
+        try:
+            for profile in PROFILE_LIBRARY:
+                rows=c.execute("""SELECT hit24,hitmain,hitz,hitping
+                                  FROM prediction_log
+                                  WHERE profile=? AND settled=1
+                                  ORDER BY CAST(target_issue AS INTEGER) DESC
+                                  LIMIT ?""",(profile,window)).fetchall()
+                n=len(rows)
+                h24=sum(int(x["hit24"] or 0) for x in rows)
+                hm=sum(int(x["hitmain"] or 0) for x in rows)
+                hz=sum(int(x["hitz"] or 0) for x in rows)
+                hp=sum(int(x["hitping"] or 0) for x in rows)
+
+                # Bayesian smoothing: avoid 0/100% overreaction with small n.
+                r24=(h24 + 4*(24/49)) / (n+4)
+                rm=(hm + 4*(4/49)) / (n+4)
+                rz=(hz + 4*(4/12)) / (n+4)
+                rp=(hp + 4*.50) / (n+4)
+
+                # Special 24-code hit is the dominant learning target.
+                score=.88*r24 + .03*rm + .05*rz + .04*rp
+                weight=math.exp(5.0*(score-.49))
+                result[profile]={
+                    "n":n,
+                    "hit24":h24,"hitmain":hm,"hitz":hz,"hitping":hp,
+                    "rate24":round(h24/n*100,1) if n else 0.0,
+                    "rateMain":round(hm/n*100,1) if n else 0.0,
+                    "rateZ":round(hz/n*100,1) if n else 0.0,
+                    "ratePing":round(hp/n*100,1) if n else 0.0,
+                    "score":score,
+                    "weight":weight
+                }
+                c.execute("""INSERT INTO learner_scores
+                  (profile,weight,n,hit24,hitmain,hitz,hitping,score,updated_at)
+                  VALUES (?,?,?,?,?,?,?,?,CURRENT_TIMESTAMP)
+                  ON CONFLICT(profile) DO UPDATE SET
+                    weight=excluded.weight,n=excluded.n,hit24=excluded.hit24,
+                    hitmain=excluded.hitmain,hitz=excluded.hitz,hitping=excluded.hitping,
+                    score=excluded.score,updated_at=CURRENT_TIMESTAMP""",
+                    (profile,weight,n,h24,hm,hz,hp,score))
+            c.commit()
+        finally:
+            c.close()
+
+    best=max(PROFILE_LIBRARY.keys(),
+             key=lambda p:(result[p]["score"],result[p]["rate24"],p)) if result else "平衡"
+    settled=max((v["n"] for v in result.values()),default=0)
+    with learner_lock:
+        learner_cache.update({
+            "ready": settled > 0,
+            "best_profile": best,
+            "profiles": result,
+            "settled": settled,
+            "window": window,
+            "updated_at": time.strftime("%Y-%m-%d %H:%M:%S")
+        })
+    return best,result
+
+def settle_predictions(issue, nums, zs):
+    """When issue X arrives, grade forecasts that had already been saved for X."""
+    actual_special=int(nums[6])
+    actual_z=normalize_z(zs[6] if len(zs)>=7 else "")
+    draw_z={normalize_z(z) for z in zs if z}
+    with db_lock:
+        c=connect()
+        try:
+            rows=c.execute("""SELECT * FROM prediction_log
+                              WHERE target_issue=? AND settled=0""",(str(issue),)).fetchall()
+            for row in rows:
+                s24=set(_csv_nums(row["special24"]))
+                m4=set(_csv_nums(row["main4"]))
+                z4=set(_csv_text(row["zodiac4"]))
+                py=normalize_z(row["pingte"] or "")
+                c.execute("""UPDATE prediction_log SET
+                    settled=1, hit24=?, hitmain=?, hitz=?, hitping=?,
+                    actual_special=?, actual_zodiac=?
+                    WHERE target_issue=? AND profile=?""",
+                    (int(actual_special in s24),
+                     int(actual_special in m4),
+                     int(bool(actual_z) and actual_z in z4),
+                     int(bool(py) and py in draw_z),
+                     actual_special, actual_z, str(issue), row["profile"]))
+            c.commit()
+        finally:
+            c.close()
+
+    if rows:
+        best,_=refresh_learner_cache(60)
+        print(f"[LEARN] settled issue={issue} models={len(rows)} best={best}",flush=True)
+
+def record_shadow_predictions(r):
+    """Save all model forecasts for the NEXT issue. Never rewrites a saved forecast."""
+    if not r:
+        return
+    try:
+        target=str(int(r[0]["issue"])+1)
+    except Exception:
+        return
+
+    t0=time.time()
+    py,_=_predict_pingte_yixiao(r)
+    records=[]
+    for profile in PROFILE_LIBRARY:
+        try:
+            c24,m4,z4,_,_=_predict_with_profile(r,profile)
+            records.append((
+                target, profile,
+                ",".join(str(n) for n in c24),
+                ",".join(str(n) for n in m4),
+                ",".join(z4),
+                py
+            ))
+        except Exception as e:
+            print(f"[LEARN] shadow {profile} failed: {type(e).__name__}: {e}",flush=True)
+
+    if records:
+        with db_lock:
+            c=connect()
+            try:
+                c.executemany("""INSERT OR IGNORE INTO prediction_log
+                    (target_issue,profile,special24,main4,zodiac4,pingte)
+                    VALUES (?,?,?,?,?,?)""",records)
+                c.commit()
+            finally:
+                c.close()
+        print(f"[LEARN] recorded target={target} models={len(records)} in {time.time()-t0:.2f}s",flush=True)
+
+def learner_validation_stats():
+    with learner_lock:
+        best=learner_cache.get("best_profile","平衡")
+        info=dict((learner_cache.get("profiles",{}).get(best,{}) or {}))
+        n=int(info.get("n",0))
+    if not info:
+        return {
+          "n":0,"target":60,"profile":best,"building":False,"learning":True,
+          "hit24":0.0,"err24":0.0,
+          "hitMain":0.0,"errMain":0.0,
+          "hitZ":0.0,"errZ":0.0,
+          "hitPingte":0.0,"errPingte":0.0
+        }
+    return {
+      "n":n,"target":60,"profile":best,"building":False,"learning":True,
+      "hit24":info.get("rate24",0.0),"err24":round(100-info.get("rate24",0.0),1),
+      "hitMain":info.get("rateMain",0.0),"errMain":round(100-info.get("rateMain",0.0),1),
+      "hitZ":info.get("rateZ",0.0),"errZ":round(100-info.get("rateZ",0.0),1),
+      "hitPingte":info.get("ratePing",0.0),"errPingte":round(100-info.get("ratePing",0.0),1)
+    }
+
+def export_learning_payload(limit=1000):
+    with db_lock:
+        c=connect()
+        try:
+            rows=c.execute("""SELECT * FROM prediction_log
+                              ORDER BY CAST(target_issue AS INTEGER) DESC, profile
+                              LIMIT ?""",(int(limit),)).fetchall()
+            return {"logs":[{k:x[k] for k in x.keys()} for x in rows]}
+        finally:
+            c.close()
+
+def import_learning_payload(payload):
+    logs=payload.get("logs",[]) if isinstance(payload,dict) else []
+    if not logs:
+        return 0
+    inserted=0
+    with db_lock:
+        c=connect()
+        try:
+            for x in logs:
+                before=c.total_changes
+                c.execute("""INSERT OR IGNORE INTO prediction_log
+                  (target_issue,profile,special24,main4,zodiac4,pingte,created_at,
+                   settled,hit24,hitmain,hitz,hitping,actual_special,actual_zodiac)
+                  VALUES (?,?,?,?,?,?,COALESCE(NULLIF(?,''),CURRENT_TIMESTAMP),
+                          ?,?,?,?,?,?,?)""",
+                  (str(x.get("target_issue","")),str(x.get("profile","")),
+                   str(x.get("special24","")),str(x.get("main4","")),
+                   str(x.get("zodiac4","")),str(x.get("pingte","")),
+                   str(x.get("created_at","")),int(x.get("settled") or 0),
+                   x.get("hit24"),x.get("hitmain"),x.get("hitz"),x.get("hitping"),
+                   x.get("actual_special"),str(x.get("actual_zodiac") or "")))
+                inserted += int(c.total_changes>before)
+            c.commit()
+        finally:
+            c.close()
+    refresh_learner_cache(60)
+    return inserted
+
+def sync_previous_learning():
+    urls=[]
+    if WEBHOOK_BASE_URL:
+        urls.append(WEBHOOK_BASE_URL+"/api/learning-export?limit=1000")
+    if HISTORY_SOURCE_URL and "/api/" in HISTORY_SOURCE_URL:
+        base=HISTORY_SOURCE_URL.split("/api/",1)[0]
+        urls.append(base+"/api/learning-export?limit=1000")
+    seen=set()
+    for url in urls:
+        if not url or url in seen:
+            continue
+        seen.add(url)
+        try:
+            rr=requests.get(url,timeout=12,headers={"User-Agent":"SanfenLearner/26"})
+            if rr.ok:
+                n=import_learning_payload(rr.json())
+                print(f"[LEARN] inherited rows={n} from {url}",flush=True)
+                return n
+        except Exception:
+            pass
+    return 0
+
 def _profile_score_on_recent(r, profile, samples=28):
     if len(r)<260:
         return 0.0
@@ -1575,7 +1848,19 @@ def _light_profile_calibration(r):
         background_state["profile_calibrating"]=False
 
 def _select_profile(r, force=False):
-    """Return immediately. Heavy historical profile selection never blocks a page request."""
+    """Use continuously learned profile when enough real forward results exist."""
+    with learner_lock:
+        learned_n=int(learner_cache.get("settled",0))
+        learned_best=learner_cache.get("best_profile","平衡")
+        learned_profiles=dict(learner_cache.get("profiles",{}) or {})
+
+    if learned_n >= 8 and learned_best in PROFILE_LIBRARY:
+        scores={p:round(v.get("score",0.0)*100,1) for p,v in learned_profiles.items()}
+        model_state["profile"]=learned_best
+        model_state["profile_scores"]=scores
+        model_state["calibration_n"]=min(learned_n,60)
+        return learned_best,scores
+
     latest_issue=r[0]["issue"] if r else None
     cached=model_state.get("profile") or "平衡"
     last=model_state.get("last_calibrated_issue")
@@ -1595,7 +1880,6 @@ def _select_profile(r, force=False):
             name="profile-calibration"
         ).start()
 
-    # First request/deploy uses balanced weights immediately.
     if not model_state.get("profile"):
         model_state["profile"]="平衡"
         model_state["profile_scores"]={"平衡":0.0}
@@ -1722,6 +2006,14 @@ def build_model():
       "profile":profile,
       "profile_scores":profile_scores,
       "calibration_n":model_state.get("calibration_n",0),
+      "learning":{
+        "enabled":True,
+        "best_profile":learner_cache.get("best_profile","平衡"),
+        "settled":learner_cache.get("settled",0),
+        "target":60,
+        "rate24":(learner_cache.get("profiles",{}).get(learner_cache.get("best_profile","平衡"),{}) or {}).get("rate24",0.0),
+        "updated_at":learner_cache.get("updated_at","")
+      },
       "forecast":{
         "target_issue":next_issue,
         "transition_samples":transition_meta.get("samples",0),
@@ -1766,6 +2058,16 @@ def rebuild_live_cache():
             live_cache["data"]=data
             live_cache["issue"]=data.get("issue") if isinstance(data,dict) else None
         print(f"[CACHE] model rebuilt issue={data.get('issue')} in {time.time()-t0:.2f}s",flush=True)
+        try:
+            rr=recent_rows(1200)
+            threading.Thread(
+                target=record_shadow_predictions,
+                args=(rr,),
+                daemon=True,
+                name="continuous-learning-shadow"
+            ).start()
+        except Exception as e:
+            print(f"[LEARN] shadow start failed: {e}",flush=True)
         return data
     except Exception as e:
         print(f"[CACHE] model rebuild failed: {type(e).__name__}: {e}",flush=True)
@@ -1800,6 +2102,8 @@ def health():
                     "stats_building":background_state.get("stats_building",False),
                     "long_prior_ready":bool(long_prior.get("ready")),
                     "long_prior_rows":int(long_prior.get("total",0)),
+                    "learning_settled":int(learner_cache.get("settled",0)),
+                    "learning_best":learner_cache.get("best_profile","平衡"),
                     "db":DB,"sqlite_mode":"WAL","telegram":bool(BOT_TOKEN),
                     "telegram_mode":"webhook","webhook_base":WEBHOOK_BASE_URL,"count":count})
 
@@ -1827,15 +2131,27 @@ def _build_stats_background():
 
 @app.get("/api/stats")
 def stats_api():
-    # Never run a historical backtest inside an HTTP request.
-    val=stats_cache.get("value")
-    if val is None:
-        val={"n":0,"hit24":0.0,"err24":0.0,"hitMain":0.0,"errMain":0.0,
-             "hitZ":0.0,"errZ":0.0,"hitPingte":0.0,"errPingte":0.0,
-             "profile":model_state.get("profile") or "平衡","building":True,"n":0}
-        if not background_state.get("stats_building"):
-            threading.Thread(target=_build_stats_background,daemon=True,name="stats-builder").start()
-    return jsonify(val)
+    return jsonify(learner_validation_stats())
+
+@app.get("/api/learning")
+def learning_status():
+    with learner_lock:
+        return jsonify({
+          "best_profile":learner_cache.get("best_profile","平衡"),
+          "settled":learner_cache.get("settled",0),
+          "window":learner_cache.get("window",60),
+          "profiles":learner_cache.get("profiles",{}),
+          "updated_at":learner_cache.get("updated_at","")
+        })
+
+@app.get("/api/learning-export")
+def learning_export():
+    try:
+        limit=max(20,min(int(request.args.get("limit","1000")),5000))
+    except Exception:
+        limit=1000
+    return jsonify(export_learning_payload(limit))
+
 
 @app.get("/api/history")
 def history():
@@ -2014,6 +2330,10 @@ def boot():
 
     # Preserve latest bot-collected history before takeover.
     sync_best_available_history()
+
+    # From v26 onward, also inherit learned prediction/score history.
+    sync_previous_learning()
+    refresh_learner_cache(60)
 
     # Make the site usable immediately. Do NOT wait for model/backtest here.
     try:
