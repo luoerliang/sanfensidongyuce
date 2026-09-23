@@ -169,6 +169,17 @@ box-shadow:0 12px 30px #0007;opacity:0;pointer-events:none;transition:.2s;z-inde
 
   <section class="card">
     <div class="sectionHead">
+      <div class="sectionTitle">下一期预测状态</div>
+      <div class="sectionHint">不是把刚开奖号追进去</div>
+    </div>
+    <div class="strategyGrid">
+      <div class="strategyBox"><div class="strategyTitle">预测目标</div><div id="forecastTarget" class="strategyMain">--</div></div>
+      <div class="strategyBox"><div class="strategyTitle">前瞻模型</div><div id="forecastMode" class="strategyMain">--</div></div>
+    </div>
+  </section>
+
+  <section class="card">
+    <div class="sectionHead">
       <div>
         <div class="sectionTitle">24个动态特码</div>
         <div class="sectionHint">12肖×2码 · 每期重算 · 升序</div>
@@ -248,7 +259,7 @@ box-shadow:0 12px 30px #0007;opacity:0;pointer-events:none;transition:.2s;z-inde
   </section>
 
   <div id="toast" class="toast">已复制</div>
-  <div class="foot">号码颜色按红 / 蓝 / 绿波显示。新版把波色、生肖、大小、单双作为近期统计特征参与动态评分；冷热、牛马羊条件、头数判断都必须由历史样本支持才启用；所谓“杀头”只做降权，不会硬删整头。命中率使用独立历史验证窗口，不代表未来中奖概率。</div>
+  <div class="foot">号码颜色按红 / 蓝 / 绿波显示。新版把波色、生肖、大小、单双作为近期统计特征参与动态评分；预测使用“当前状态→历史下一期结果”的一阶转移模型，并刻意减少刚开奖号对下一期的直接追涨。冷热、头数等只作辅助特征；命中率不代表未来中奖概率。</div>
 </div>
 
 <script>
@@ -294,6 +305,9 @@ async function loadMain(){
     parityTrend.innerHTML=`单 ${pa['单']??0}%<br>双 ${pa['双']??0}%`;
     const ps=d.profile_scores||{};
     profileInfo.textContent=`当前模型 ${d.profile||'--'} · 最近校准分 ${ps[d.profile]??0}%`;
+    const fc=d.forecast||{};
+    forecastTarget.textContent=fc.target_issue?`预测 ${fc.target_issue} 期`:'--';
+    forecastMode.innerHTML=`${fc.mode||'前瞻预测'}<br>转移样本 ${fc.transition_samples??0}`;
     const sg=d.strategy||{};
     coldSignal.innerHTML=sg.cold_rebound_now?'冷反弹信号：启用<br>24码允许热+冷防守':'冷反弹信号：普通<br>仍以热码为主';
     coldZodiac.innerHTML=(sg.cold_zodiacs||[]).length?`偏冷：${sg.cold_zodiacs.join('、')}`:'暂无';
@@ -302,7 +316,7 @@ async function loadMain(){
     latestZodiac.textContent=d.latest_special_zodiac?`特码生肖 ${d.latest_special_zodiac}`:'特码生肖 --';
     lastIngest.textContent=d.latest_created_at?`最后录入 ${d.latest_created_at}`:'实时录入';
     tg.textContent=d.telegram?'Telegram 已连接':'Telegram 未配置';
-    adaptiveInfo.textContent=`自动校准：${d.profile||'--'} · 24码=每肖2码 · 4肖1码每期重算`;
+    adaptiveInfo.textContent=`前瞻预测：${d.next_issue||'--'}期 · 每肖2码 · 4肖1码`;
     calcState.textContent=d.recalculating?'新期开奖已入库 · 模型重算中':'模型已更新';
     calcState.className=d.recalculating?'pill':'pill ok';
 
@@ -905,60 +919,163 @@ def _strategy_context(r):
       "head":head
     }
 
-def _hot_number_score_by_zodiac(r, profile, ctx=None):
-    """Dynamic hot/cold blended score.
-    Hot frequency dominates; cold-rebound and weak-head factors only modify it
-    when the data supports those signals."""
+def _forward_transition_scores(r):
+    """One-step-ahead transition model.
+    Uses historical state(t) -> result(t+1) pairs. The current latest draw is only
+    used as the conditioning state; its number is NOT counted as a 'hot hit' for itself."""
+    num_score=defaultdict(float)
+    z_score=defaultdict(float)
+    head_score=defaultdict(float)
+    wave_score=defaultdict(float)
+    size_score=defaultdict(float)
+    parity_score=defaultdict(float)
+
+    if len(r) < 80:
+        return num_score,z_score,head_score,wave_score,size_score,parity_score,{"samples":0}
+
+    cur=r[0]
+    cur_n=cur["special"]
+    cur_z=normalize_z(cur["z7"] or "")
+    cur_head=head_of(cur_n)
+    cur_wave=wave_of(cur_n)
+    cur_size=size_of(cur_n)
+    cur_parity=parity_of(cur_n)
+
+    samples=0
+    exact_samples=0
+    # r is newest -> oldest. Historical transition: r[j] (state) -> r[j-1] (next outcome).
+    maxj=min(len(r)-1,1800)
+    for j in range(1,maxj):
+        prev=r[j]
+        out=r[j-1]
+        pn=prev["special"]
+        pz=normalize_z(prev["z7"] or "")
+        on=out["special"]
+        oz=normalize_z(out["z7"] or "")
+
+        # Recency decay over historical transitions.
+        w=exp_weight(j,260)
+        match=0.0
+        if pn==cur_n:
+            match += 2.10
+            exact_samples += 1
+        if pz==cur_z:
+            match += 1.65
+        if head_of(pn)==cur_head:
+            match += .70
+        if wave_of(pn)==cur_wave:
+            match += .55
+        if size_of(pn)==cur_size:
+            match += .45
+        if parity_of(pn)==cur_parity:
+            match += .40
+
+        # Two-step context: previous zodiac/head sequence when available.
+        if j+1 < len(r):
+            older=r[j+1]
+            if normalize_z(older["z7"] or "") == normalize_z(r[1]["z7"] or ""):
+                match += .55
+            if head_of(older["special"]) == head_of(r[1]["special"]):
+                match += .25
+
+        if match <= 0:
+            continue
+
+        ww=w*match
+        samples += 1
+        num_score[on] += ww
+        if oz:
+            z_score[oz] += ww
+        head_score[head_of(on)] += ww
+        wave_score[wave_of(on)] += ww
+        size_score[size_of(on)] += ww
+        parity_score[parity_of(on)] += ww
+
+    # Normalize each family so it contributes comparably.
+    def norm(d):
+        if not d: return d
+        vals=list(d.values())
+        lo=min(vals); hi=max(vals)
+        if hi-lo < 1e-9:
+            return defaultdict(float,{k:0.5 for k in d})
+        return defaultdict(float,{k:(v-lo)/(hi-lo) for k,v in d.items()})
+
+    return (
+      norm(num_score),norm(z_score),norm(head_score),
+      norm(wave_score),norm(size_score),norm(parity_score),
+      {"samples":samples,"exact_samples":exact_samples}
+    )
+
+def _base_hot_score_without_latest(r, profile):
+    """Trend score for next-period prediction.
+    Excludes r[0] from direct frequency counts to avoid simply chasing what just opened."""
     p=PROFILE_LIBRARY[profile]
+    hist=r[1:] if len(r)>1 else r
     score={n:0.0 for n in range(1,50)}
-    trend=_trend_profiles(r)
-    ctx=ctx or _strategy_context(r)
+    trend=_trend_profiles(hist if hist else r)
 
-    # Recent occurrence score.
-    for horizon,half,coef in [(6,2,2.40),(12,4,2.00),(24,8,1.55),(60,18,1.00),(120,38,.55)]:
-        for i,x in enumerate(r[:min(horizon,len(r))]):
+    for horizon,half,coef in [(6,2,2.05),(12,4,1.75),(24,8,1.35),(60,18,.92),(120,38,.48)]:
+        for i,x in enumerate(hist[:min(horizon,len(hist))]):
             w=coef*exp_weight(i,half)
-            score[x["special"]] += 1.85*w
+            score[x["special"]] += 1.50*w
             for j in range(1,7):
-                score[x[f"n{j}"]] += .62*w
+                score[x[f"n{j}"]] += .48*w
 
-    # Acceleration.
+    # Acceleration also ends at r[1], not the just-opened r[0].
     now=Counter(); old=Counter()
-    for x in r[:6]:
-        now[x["special"]]+=1.8
-        for j in range(1,7): now[x[f"n{j}"]]+=.55
-    for x in r[6:24]:
-        old[x["special"]]+=1.8
-        for j in range(1,7): old[x[f"n{j}"]]+=.55
+    for x in hist[:6]:
+        now[x["special"]]+=1.7
+        for j in range(1,7): now[x[f"n{j}"]]+=.50
+    for x in hist[6:24]:
+        old[x["special"]]+=1.7
+        for j in range(1,7): old[x[f"n{j}"]]+=.50
 
-    weak04=ctx["head"].get("active_04","")
     for n in range(1,50):
-        score[n] += 1.10*p["accel"]*(now[n]/6.0-old[n]/18.0)
-        score[n] += .35*p["wave"]*trend["wave"].get(wave_of(n),0)
-        score[n] += .22*p["size"]*trend["size"].get(size_of(n),0)
-        score[n] += .20*p["parity"]*trend["parity"].get(parity_of(n),0)
-
-        # Cold-code defense: normally small. After 牛/马/羊, only becomes stronger
-        # if historical transitions actually show a meaningful cold-rebound lift.
-        cold=ctx["num_cold"].get(n,0)
-        if ctx["cold_rebound_now"]:
-            score[n] += 1.05*cold
-        else:
-            score[n] += .22*cold
-
-        # "Kill head" is implemented as a downweight, never a hard deletion.
-        if weak04 and head_of(n)==weak04:
-            score[n] -= .85
-
+        score[n] += .90*p["accel"]*(now[n]/6.0-old[n]/18.0)
+        score[n] += .28*p["wave"]*trend["wave"].get(wave_of(n),0)
+        score[n] += .17*p["size"]*trend["size"].get(size_of(n),0)
+        score[n] += .16*p["parity"]*trend["parity"].get(parity_of(n),0)
     return score
 
+def _predictive_number_scores(r, profile, ctx=None):
+    """Forecast score for NEXT issue, not a mirror of the latest issue."""
+    ctx=ctx or _strategy_context(r)
+    score=_base_hot_score_without_latest(r,profile)
+    num_t,z_t,head_t,wave_t,size_t,par_t,meta=_forward_transition_scores(r)
+
+    weak04=ctx["head"].get("active_04","")
+    latest_n=r[0]["special"] if r else None
+    latest_z=normalize_z(r[0]["z7"] or "") if r else ""
+
+    for n in range(1,50):
+        # Forward transition is the strongest incremental feature.
+        score[n] += 2.10*num_t[n]
+        score[n] += .75*head_t[head_of(n)]
+        score[n] += .62*wave_t[wave_of(n)]
+        score[n] += .52*size_t[size_of(n)]
+        score[n] += .48*par_t[parity_of(n)]
+
+        # Cold-defense logic remains evidence-based.
+        cold=ctx["num_cold"].get(n,0)
+        score[n] += (0.85 if ctx["cold_rebound_now"] else 0.15)*cold
+
+        # Weak-head signal is a downweight only.
+        if weak04 and head_of(n)==weak04:
+            score[n] -= .70
+
+        # Anti-chase cooldown: do not promote the number just because it opened.
+        # Repeats are still possible if transition history supports them.
+        if latest_n is not None and n==latest_n:
+            score[n] -= .75
+
+    return score,meta,z_t
+
 def _candidate24_by_zodiac(r, profile):
-    """Exactly 24 = 12 zodiacs × 2 codes.
-    Default: two hottest codes. When a validated cold-rebound signal is active,
-    a zodiac may use one hot + one cold-defense code if that code is competitive."""
+    """Exactly 24 = 12 zodiacs × 2 forward-looking codes.
+    Each zodiac contributes two numbers with the highest NEXT-issue score."""
     zmap=_number_zodiac_map(r)
     ctx=_strategy_context(r)
-    ns=_hot_number_score_by_zodiac(r,profile,ctx)
+    ns,transition_meta,ztrans=_predictive_number_scores(r,profile,ctx)
 
     pools={z:[] for z in ALL_ZODIACS}
     for n in range(1,50):
@@ -968,37 +1085,31 @@ def _candidate24_by_zodiac(r, profile):
 
     groups=[]; selected=[]; used=set()
     for z in ALL_ZODIACS:
-        hot_rank=sorted(pools[z],key=lambda n:(-ns[n],n))
-        codes=hot_rank[:2]
+        ranked=sorted(pools[z],key=lambda n:(-ns[n],n))
+        codes=ranked[:2]
 
-        # Cold defense only if supported by current context.
-        if ctx["cold_rebound_now"] and len(hot_rank)>=3:
-            cold_rank=sorted(
-                pools[z],
-                key=lambda n:(-ctx["num_cold"].get(n,0), -ns[n], n)
-            )
-            cold_choice=cold_rank[0]
-            # Replace weaker of the 2 only if cold candidate still has reasonable score.
-            if cold_choice not in codes and ns[cold_choice] >= ns[codes[-1]]-0.65:
-                codes=[codes[0],cold_choice]
+        # In a validated cold-rebound phase, allow the second code to be a competitive cold code.
+        if ctx["cold_rebound_now"] and len(ranked)>=3:
+            cold_rank=sorted(pools[z],key=lambda n:(-ctx["num_cold"].get(n,0),-ns[n],n))
+            cc=cold_rank[0]
+            if cc not in codes and ns[cc] >= ns[codes[-1]]-.55:
+                codes=[codes[0],cc]
 
         groups.append({"zodiac":z,"codes":codes})
         for n in codes:
             if n not in used:
                 selected.append(n); used.add(n)
 
-    # Defensive fallback to exactly 24.
     if len(selected)<24:
-        global_rank=sorted(range(1,50),key=lambda n:(-ns[n],n))
-        for n in global_rank:
+        for n in sorted(range(1,50),key=lambda n:(-ns[n],n)):
             if n not in used:
                 selected.append(n); used.add(n)
             if len(selected)>=24: break
 
-    return selected[:24],groups,ns,_zodiac_scores_profile(r,profile),ctx
+    return selected[:24],groups,ns,_zodiac_scores_profile(r,profile),ctx,transition_meta,ztrans
 
-def _dynamic_zodiac4_one_code(r, profile, groups, ns, zs, ctx):
-    """4肖一肖一码. Recomputed every issue from trend + cold rebound + momentum."""
+def _dynamic_zodiac4_one_code(r, profile, groups, ns, zs, ctx, ztrans):
+    """Predict 4 zodiacs for the NEXT issue using transition + trend, one code each."""
     if not r:
         return [],[]
 
@@ -1008,31 +1119,27 @@ def _dynamic_zodiac4_one_code(r, profile, groups, ns, zs, ctx):
     adjusted={}
     for z in ALL_ZODIACS:
         momentum=zs.get(z,0)-prev_zs.get(z,0)
-        adjusted[z]=zs.get(z,0)+1.35*momentum
+        adjusted[z]=zs.get(z,0)+1.05*momentum
+        adjusted[z]+=1.50*ztrans[z]
+        adjusted[z]+=(.72 if ctx["cold_rebound_now"] else .12)*ctx["z_cold"].get(z,0)
 
-        # Cold-zodiac defense gets a modest boost, stronger only in validated NMY phase.
-        cold=ctx["z_cold"].get(z,0)
-        adjusted[z] += (.85 if ctx["cold_rebound_now"] else .18)*cold
-
-        # Reduce immediate repeat slightly so 4肖 can respond each period without random rotation.
+        # Small anti-chase cooldown. Historical transition can overcome it.
         if z==latest_z:
-            adjusted[z]-=.16*max(abs(zs.get(z,0)),1.0)
+            adjusted[z]-=.12*max(abs(zs.get(z,0)),1.0)
 
     z4=sorted(ALL_ZODIACS,key=lambda z:(-adjusted.get(z,-1e9),z))[:4]
     groupmap={g["zodiac"]:g["codes"] for g in groups}
-
-    pairs=[]; main4=[]
+    pairs=[]
     for z in z4:
         codes=groupmap.get(z,[])
         if codes:
             code=max(codes,key=lambda n:(ns.get(n,-1e9),-n))
-            main4.append(code)
             pairs.append({"zodiac":z,"code":code})
     return z4,pairs
 
 def _predict_with_profile(r, profile):
-    cand24,groups,ns,zs,ctx=_candidate24_by_zodiac(r,profile)
-    z4,zpairs=_dynamic_zodiac4_one_code(r,profile,groups,ns,zs,ctx)
+    cand24,groups,ns,zs,ctx,tmeta,ztrans=_candidate24_by_zodiac(r,profile)
+    z4,zpairs=_dynamic_zodiac4_one_code(r,profile,groups,ns,zs,ctx,ztrans)
     main4=[p["code"] for p in zpairs]
     return cand24,main4,z4,groups,zpairs
 
@@ -1134,6 +1241,7 @@ def build_model():
     c24,m4,z4,groups,zpairs=_predict_with_profile(r,profile)
     trend=_trend_profiles(r)
     strategy=_strategy_context(r)
+    _nt,_zt,_ht,_wt,_st,_pt,transition_meta=_forward_transition_scores(r)
     latest=r[0]
     latest_numbers=[latest[f"n{i}"] for i in range(1,7)]+[latest["special"]]
     try: next_issue=str(int(latest["issue"])+1)
@@ -1149,6 +1257,12 @@ def build_model():
       "zodiac_pairs":[{"zodiac":p["zodiac"],"code":f"{p['code']:02d}"} for p in zpairs],
       "profile":profile,
       "profile_scores":profile_scores,
+      "forecast":{
+        "target_issue":next_issue,
+        "transition_samples":transition_meta.get("samples",0),
+        "exact_previous_number_samples":transition_meta.get("exact_samples",0),
+        "mode":"前瞻一阶转移 + 趋势（不追上期）"
+      },
       "strategy":{
         "cold_rebound_now":strategy["cold_rebound_now"],
         "cold_zodiacs":strategy["cold_zodiacs"],
