@@ -93,11 +93,13 @@ def parse_draw(text):
     lines=[x.strip() for x in text.splitlines() if x.strip()]
     nums=None
     for line in lines:
-        vals=re.findall(r"(?<!\d)(?:[1-9]|[1-4]\d)(?!\d)",line)
+        # 支持官方机器人常见的 01~09 前导零格式，以及 1~9 / 10~49
+        vals=re.findall(r"(?<!\d)(?:0?[1-9]|[1-4]\d)(?!\d)", line)
         if len(vals)==7:
             cand=[int(x) for x in vals]
             if len(set(cand))==7 and all(1<=n<=49 for n in cand):
-                nums=cand;break
+                nums=cand
+                break
     if not nums:return None
     zs=re.findall(r"[鼠牛虎兔龙龍蛇马馬羊猴鸡雞狗猪豬]",text)
     zs=[normalize_z(x) for x in zs[-7:]] if len(zs)>=7 else [""]*7
@@ -206,13 +208,35 @@ async def cmd_status(update:Update,context:ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"运行正常\\n历史期数: {m['count']}\\n最新期号: {m['issue']}")
 
 async def receive(update:Update,context:ContextTypes.DEFAULT_TYPE):
-    if not update.message or not update.message.text:return
-    if ALLOWED_CHAT_ID and str(update.effective_chat.id)!=ALLOWED_CHAT_ID:return
+    if not update.message or not update.message.text:
+        return
+
+    sender = update.effective_user
+    sender_name = (sender.username if sender else None) or (sender.full_name if sender else "unknown")
+    sender_is_bot = bool(getattr(sender, "is_bot", False)) if sender else False
+    print(f"[TG] chat={update.effective_chat.id} sender={sender_name} is_bot={sender_is_bot} text={update.message.text[:160]!r}", flush=True)
+
+    if ALLOWED_CHAT_ID and str(update.effective_chat.id) != ALLOWED_CHAT_ID:
+        print(f"[TG] ignored: chat id does not match ALLOWED_CHAT_ID={ALLOWED_CHAT_ID}", flush=True)
+        return
+
     p=parse_draw(update.message.text)
-    if not p:return
+    if not p:
+        print("[TG] received but parser did not recognize a complete draw", flush=True)
+        return
+
     issue,nums,zs,colors=p
+    print(f"[TG] parsed issue={issue} nums={nums} zodiac={zs} colors={colors}", flush=True)
     if add_draw(issue,nums,zs,colors,update.message.text):
-        await update.message.reply_text(f"已入库 {issue}，共7码；统计结果已更新。")
+        print(f"[TG] inserted issue={issue}", flush=True)
+        # 避免与官方开奖机器人形成 bot-to-bot 回复循环；只有真人消息才回复确认。
+        if not sender_is_bot:
+            try:
+                await update.message.reply_text(f"已入库 {issue}，统计结果已更新。")
+            except Exception as e:
+                print(f"[TG] inserted but reply failed: {type(e).__name__}: {e}", flush=True)
+    else:
+        print(f"[TG] duplicate/invalid issue={issue}, not inserted", flush=True)
 
 async def post_init(application):
     # Removes stale webhook so long polling can work.

@@ -1,23 +1,22 @@
-# 三分六合彩 智能稳定版 v4
+# 三分六合彩 智能稳定版 v5
 
-v4 修复：
-- 修复 Render 日志中的 `set_wakeup_fd only works in main thread`。
-- Telegram polling 在后台线程运行时禁用 signal handlers。
-- 使用 Gunicorn 运行 Web 服务，不再使用 Flask development server。
-- Gunicorn 启动时自动初始化 SQLite、导入 history.csv、启动 Telegram worker。
-- 保留 `/id`、`/status`、开奖消息解析、去重、22特码/4码/4肖动态模型。
-- 波色不参与特码和4码评分。
+本版针对“机器人正常、网页正常，但官方开奖不入库”的问题修复。
+
+## v5 关键修复
+- 修复 `01`、`03`、`05` 等带前导零号码无法解析的问题。
+- 支持 01~09、1~9、10~49。
+- Render 日志会明确显示：是否收到 TG 消息、发送者是不是机器人、解析出的期号和7码、是否成功入库。
+- 对官方机器人消息只入库、不自动回复，避免 bot-to-bot 回复循环。
+- 保留 v4 的 Gunicorn、/id、/status、动态22特码、4码、4肖、波色独立逻辑。
 
 ## Render 环境变量
-BOT_TOKEN = 你的机器人 Token
-DB_PATH = history.db
-ALLOWED_CHAT_ID 初次测试先不要设置。
+- BOT_TOKEN = 你的新 Token
+- DB_PATH = history.db
+- ALLOWED_CHAT_ID = -5560268424  （你的开奖群 Chat ID；可以填上）
 
-## 部署后测试
-私聊机器人：
-/id
-/status
+部署后等下一期开奖，Render Logs 正常应看到：
+`[TG] ... is_bot=True ...`
+`[TG] parsed issue=... nums=[...]`
+`[TG] inserted issue=...`
 
-如果 `/id` 和 `/status` 正常，再配置群组接收方式。
-
-注意：`history.db` 在 Render 免费实例的普通文件系统中不是永久持久化存储；重新部署可能丢失部署后新增记录。确认功能正常后应迁移到持久化存储。
+然后网页历史期数会增加，最新期号、22码、4码、4肖会刷新。
