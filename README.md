@@ -1,46 +1,27 @@
-# 澳门三分彩 TG 自动接收版（Render 一键部署）
+# 三分时时彩智能稳定版 v3
 
-这个版本专门为 iPhone + Render 做了简化：
-- 不再需要 `templates` 文件夹
-- 页面直接内置在 `app.py`
-- 自带 `render.yaml`
-- 数据库默认使用 `/var/data/history.db`
-- 保留 `history.csv` 作为初始历史数据
-- Telegram 消息自动解析期号、7号码、7生肖、7波色
-- 自动去重并重新计算 22特码、4码、4肖
-- 波色不参与特码和4码评分
+修复：
+- 修复缺少 `import csv` 导致 Render 启动失败。
+- 默认数据库改为 `history.db`，不会因为不存在 `/var/data` 而启动失败。
+- 自动清理旧 Telegram webhook 后启动 long polling。
+- `/id` 返回当前聊天 Chat ID。
+- `/status` 返回历史期数和最新期号。
+- 自动导入 history.csv，已有数据库时不会重复导入。
+- 新期开奖按期号去重并校验 7 个号码。
 
-## 最简单部署方式
+算法：
+- 特码使用多时间尺度指数衰减、长期收缩、遗漏弱因子和弱正码上下文的集成评分。
+- 4码和4肖使用独立多窗口衰减模型。
+- 波色只保存，不进入特码/4码评分。
+- 22个特码最终按数字升序显示。
 
-### 方式 A：上传到 GitHub
-解压这个 ZIP 后，GitHub 仓库根目录直接上传这些文件：
-app.py
-Dockerfile
-requirements.txt
-render.yaml
-history.csv
-.env.example
-README.md
+Render：
+1. 上传这些文件到 GitHub 仓库根目录。
+2. Render 建 Web Service / Blueprint。
+3. Environment 添加 BOT_TOKEN。
+4. 初次测试时 ALLOWED_CHAT_ID 可以留空。
+5. DB_PATH 保持 history.db。
+6. 部署成功后私聊机器人 `/id`、`/status`。
 
-注意：这个版本没有任何子文件夹。
-
-### 方式 B：Render
-Render -> New -> Blueprint
-连接 GitHub 仓库，Render 会读取 `render.yaml`。
-部署后，在服务 Environment 中填写：
-BOT_TOKEN = 你的 Telegram Bot Token
-ALLOWED_CHAT_ID = 开奖群组 chat_id
-
-不要把 Token 写入 GitHub。
-
-## Telegram
-机器人必须加入开奖群组，并按 Telegram 的 Bot-to-Bot/Privacy Mode 规则配置，确保能看到官方开奖机器人的消息。
-
-## 消息格式
-例如：
-澳门三分彩第:20260923435期开奖结果:
-25 27 18 30 35 44 11
-馬 龍 牛 牛 猴 豬 猴
-🔵 🟢 🔴 🔴 🔴 🟢 🟢
-
-程序按前6个号码为正码、最后一个为特码。
+注意：Render 非持久磁盘环境重新部署可能丢失运行期间新增的 SQLite 数据。确认程序稳定后，再迁移到持久数据库/磁盘。
+彩票开奖结果具有随机性；本程序输出是历史统计候选，不保证命中。
