@@ -1,6 +1,6 @@
 services:
   - type: web
-    name: sanfen-smart-v3
+    name: sanfen-dashboard-v7
     runtime: docker
     envVars:
       - key: BOT_TOKEN
