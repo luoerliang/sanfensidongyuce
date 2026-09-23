@@ -1,31 +1,32 @@
-# 三分六合彩 Webhook修复版 v11
+# 三分六合彩 趋势自适应版 v12
 
-修复你截图中的：
-`ModuleNotFoundError: No module named 'telegram'`
+本版按最新要求升级：
 
-原因：上一版 Webhook 改造时旧的 `from telegram import Update` 仍残留在 app.py，
-但 requirements 已经移除了 python-telegram-bot。
+- 波色走势加入动态评分（不再只是显示）
+- 生肖走势加入动态评分
+- 大小指数加入动态评分
+- 单双走势加入动态评分
+- 22码继续自适应动态换码
+- 4肖改用更短的 6/12/24/50 期窗口 + 趋势加速度，更容易随新期开奖变化
+- 不随机强换；当外围生肖趋势明显上升且接近临界位时，优先轮换
+- 4肖和对应号码真正绑定在一起
+- 每个生肖自动选 1~3 个近期综合分最高号码
+- 每肖第一码作为“主码”，因此4个主码与4肖一一对应
+- 号码显示更小
+- 页面明确显示开奖结果
+- 新增波色/大小/单双走势百分比
+- 网页实时主数据从10秒刷新改为2秒
+- 回测单独每30秒刷新，避免拖慢主页面
+- 历史每20秒刷新
+- 保留 Webhook 稳定接收、22码一键复制、历史滚动、红蓝绿号码色、命中率/错误率
 
-v11 已彻底删除 python-telegram-bot 和所有 long polling / getUpdates 代码，
-只使用 `requests + Telegram Bot API Webhook`。
+说明：
+“走势”表示历史数据的近期统计变化，不表示存在可识别的庄家操控规律。
+任何历史命中率都不是未来中奖概率。
 
-## 部署后正常日志
-应看到：
-`[TG] setWebhook url=https://...onrender.com/telegram/webhook -> 200 ...`
-
-收到开奖：
-`[TG-WEBHOOK] parsed issue=...`
-`[TG-WEBHOOK] inserted issue=...`
-
-## Render 环境变量
-BOT_TOKEN = 当前 Token
-ALLOWED_CHAT_ID = -5560268424
-DB_PATH = history.db
-
-一般不需要 WEBHOOK_BASE_URL。
-程序优先读取 Render 自动变量，识别失败时才手动填：
-`WEBHOOK_BASE_URL=https://你的服务名.onrender.com`
-
-## 保留功能
-自适应动态换码、22码一键复制、4肖4码同屏、开奖结果、红蓝绿号码、
-近60期回测命中率/错误率、历史滚动、/id、/status。
+部署：
+用本 ZIP 全部文件覆盖 GitHub 旧文件，Render 重新部署。
+环境变量继续使用：
+BOT_TOKEN
+ALLOWED_CHAT_ID=-5560268424
+DB_PATH=history.db
