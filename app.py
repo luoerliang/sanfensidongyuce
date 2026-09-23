@@ -28,7 +28,8 @@ model_state = {
     "profile_scores": {},
     "last_calibrated_issue": None,
     "recalc_started_at": "",
-    "recalc_finished_at": ""
+    "recalc_finished_at": "",
+    "calibration_n": 0
 }
 background_state = {
     "profile_calibrating": False,
@@ -271,7 +272,7 @@ box-shadow:0 12px 30px #0007;opacity:0;pointer-events:none;transition:.2s;z-inde
   </section>
 
   <section class="card">
-    <div class="sectionHead"><div class="sectionTitle">滚动回测（后台更新）</div><div class="sectionHint">命中 / 错误</div></div>
+    <div class="sectionHead"><div class="sectionTitle">滚动验证（后台更新）</div><div id="statsHint" class="sectionHint">等待样本</div></div>
     <div class="stats">
       <div class="stat"><div class="statName">24码</div><div id="hit22" class="rate">--</div><div id="err22" class="err"></div></div>
       <div class="stat"><div class="statName">4肖1码</div><div id="hit4" class="rate">--</div><div id="err4" class="err"></div></div>
@@ -336,7 +337,7 @@ async function loadMain(){
     sizeTrend.innerHTML=`大 ${sz['大']??0}%<br>小 ${sz['小']??0}%`;
     parityTrend.innerHTML=`单 ${pa['单']??0}%<br>双 ${pa['双']??0}%`;
     const ps=d.profile_scores||{};
-    profileInfo.textContent=`当前模型 ${d.profile||'--'} · 最近校准分 ${ps[d.profile]??0}%`;
+    profileInfo.textContent=`当前模型 ${d.profile||'--'} · 校准${d.calibration_n??0}期 · 得分 ${ps[d.profile]??0}%`;
     const fc=d.forecast||{};
     forecastTarget.textContent=fc.target_issue?`预测 ${fc.target_issue} 期`:'--';
     forecastMode.innerHTML=`${fc.mode||'前瞻预测'}<br>转移样本 ${fc.transition_samples??0} · 全历史 ${fc.long_prior_ready?'已缓存':'后台加载'}`;
@@ -358,6 +359,7 @@ async function loadStats(){
   try{
     const r=await fetch('/api/stats?_='+Date.now(),{cache:'no-store'});
     const st=await r.json();
+    statsHint.textContent=st.building?'后台计算中':`验证 ${st.n??0} 期 · 24码随机覆盖基线约49%`;
     if(st.building){
       hit22.textContent='计算中'; err22.textContent='';
       hit4.textContent='计算中'; err4.textContent='';
@@ -1322,12 +1324,56 @@ def _predictive_number_scores(r, profile, ctx=None):
     meta["ensemble"]="转移+遗漏风险+尾数转移+结构"
     return score,meta,z_t
 
+def _within_zodiac_pair_bonus(r, zmap):
+    """Stabilized within-zodiac ranking for the 2-of-each-zodiac rule.
+    Uses only past draws before the latest issue and Bayesian smoothing so one
+    short streak cannot dominate the two selected numbers."""
+    hist=r[1:] if len(r)>1 else r
+    bonus=defaultdict(float)
+
+    for horizon,half,coef in [(24,8,1.35),(80,24,1.00),(240,75,.70),(700,220,.35)]:
+        counts=defaultdict(lambda: defaultdict(float))
+        totals=defaultdict(float)
+        rr=hist[:min(horizon,len(hist))]
+        for i,x in enumerate(rr):
+            n=x["special"]
+            z=zmap.get(n)
+            if not z:
+                continue
+            w=exp_weight(i,half)
+            counts[z][n]+=w
+            totals[z]+=w
+
+        for z in ALL_ZODIACS:
+            pool=[n for n in range(1,50) if zmap.get(n)==z]
+            if not pool:
+                continue
+            # Symmetric pseudo-count prevents overreacting to sparse recent windows.
+            alpha=.80
+            denom=totals[z]+alpha*len(pool)
+            for n in pool:
+                share=(counts[z].get(n,0.0)+alpha)/max(denom,1e-9)
+                bonus[n]+=coef*share
+
+    return bonus
+
+def _norm_pool(values, pool):
+    if not pool:
+        return {}
+    arr=[values.get(n,0.0) for n in pool]
+    lo=min(arr); hi=max(arr)
+    if hi-lo<1e-9:
+        return {n:.5 for n in pool}
+    return {n:(values.get(n,0.0)-lo)/(hi-lo) for n in pool}
+
 def _candidate24_by_zodiac(r, profile):
-    """Exactly 24 = 12 zodiacs × 2 forward-looking codes.
-    Each zodiac contributes two numbers with the highest NEXT-issue score."""
+    """Exactly 24 = 12 zodiacs × 2 codes.
+    Within each zodiac, combine next-issue score with a stabilized historical
+    2-of-zodiac selector. This targets the actual 24-code hit rate directly."""
     zmap=_number_zodiac_map(r)
     ctx=_strategy_context(r)
     ns,transition_meta,ztrans=_predictive_number_scores(r,profile,ctx)
+    pair_bonus=_within_zodiac_pair_bonus(r,zmap)
 
     pools={z:[] for z in ALL_ZODIACS}
     for n in range(1,50):
@@ -1337,15 +1383,21 @@ def _candidate24_by_zodiac(r, profile):
 
     groups=[]; selected=[]; used=set()
     for z in ALL_ZODIACS:
-        ranked=sorted(pools[z],key=lambda n:(-ns[n],n))
-        codes=ranked[:2]
+        pool=pools[z]
+        ns_norm=_norm_pool(ns,pool)
+        pair_norm=_norm_pool(pair_bonus,pool)
 
-        # In a validated cold-rebound phase, allow the second code to be a competitive cold code.
-        if ctx["cold_rebound_now"] and len(ranked)>=3:
-            cold_rank=sorted(pools[z],key=lambda n:(-ctx["num_cold"].get(n,0),-ns[n],n))
-            cc=cold_rank[0]
-            if cc not in codes and ns[cc] >= ns[codes[-1]]-.55:
-                codes=[codes[0],cc]
+        combined={}
+        for n in pool:
+            # Live forecast remains the driver; stabilized within-zodiac history
+            # prevents the two chosen numbers from flipping on one noisy issue.
+            combined[n]=.66*ns_norm.get(n,.5)+.34*pair_norm.get(n,.5)
+
+            if ctx["cold_rebound_now"]:
+                combined[n]+=.08*ctx["num_cold"].get(n,0)
+
+        ranked=sorted(pool,key=lambda n:(-combined.get(n,-1e9),-ns.get(n,-1e9),n))
+        codes=ranked[:2]
 
         groups.append({"zodiac":z,"codes":codes})
         for n in codes:
@@ -1356,7 +1408,8 @@ def _candidate24_by_zodiac(r, profile):
         for n in sorted(range(1,50),key=lambda n:(-ns[n],n)):
             if n not in used:
                 selected.append(n); used.add(n)
-            if len(selected)>=24: break
+            if len(selected)>=24:
+                break
 
     return selected[:24],groups,ns,_zodiac_scores_profile(r,profile),ctx,transition_meta,ztrans
 
@@ -1495,8 +1548,9 @@ def _profile_score_on_recent(r, profile, samples=28):
         hz+=int(bool(az) and az in z4)
         n+=1
     if not n: return 0.0
-    # Coverage is the main objective, but 4肖/一肖一码 matter too.
-    return (.58*h24 + .17*hmain + .25*hz)/n
+    # User's primary objective is the 24-code special-number hit rate.
+    # 4肖 remains a secondary tie-breaker; 4肖1码 no longer dominates calibration.
+    return (.82*h24 + .05*hmain + .13*hz)/n
 
 def _light_profile_calibration(r):
     """Very small calibration pass. Never blocks the web/model rebuild path."""
@@ -1504,12 +1558,15 @@ def _light_profile_calibration(r):
         return
     background_state["profile_calibrating"]=True
     try:
-        # Limit history and validation depth aggressively for free-tier CPU.
-        rr=r[:700]
-        scores={name:_profile_score_on_recent(rr,name,1) for name in PROFILE_LIBRARY}
+        # Still background-only, but now use enough validation points to avoid
+        # nonsense such as a 0%/100% score from a single issue.
+        rr=r[:950]
+        cal_n=10
+        scores={name:_profile_score_on_recent(rr,name,cal_n) for name in PROFILE_LIBRARY}
         best=max(scores,key=lambda k:(scores[k],k))
         model_state["profile"]=best
         model_state["profile_scores"]={k:round(v*100,1) for k,v in scores.items()}
+        model_state["calibration_n"]=cal_n
         model_state["last_calibrated_issue"]=r[0]["issue"] if r else None
         print(f"[CAL] lightweight profile={best} scores={model_state['profile_scores']}",flush=True)
     except Exception as e:
@@ -1526,7 +1583,7 @@ def _select_profile(r, force=False):
     due=force or not last
     if not due and latest_issue and last:
         try:
-            due=abs(int(latest_issue)-int(last)) >= 12
+            due=abs(int(latest_issue)-int(last)) >= 18
         except Exception:
             due=False
 
@@ -1664,6 +1721,7 @@ def build_model():
       "pingte_samples":pingte_meta.get("samples",0),
       "profile":profile,
       "profile_scores":profile_scores,
+      "calibration_n":model_state.get("calibration_n",0),
       "forecast":{
         "target_issue":next_issue,
         "transition_samples":transition_meta.get("samples",0),
@@ -1757,10 +1815,10 @@ def _build_stats_background():
         return
     background_state["stats_building"]=True
     try:
-        r=recent_rows(900)
+        r=recent_rows(1100)
         # Keep this modest on the free instance. It is background diagnostics,
         # never allowed to block the web page.
-        val=backtest_stats(r,6)
+        val=backtest_stats(r,24)
         print(f"[STATS] refreshed n={val.get('n')} issue={r[0]['issue'] if r else None}",flush=True)
     except Exception as e:
         print(f"[STATS] failed: {type(e).__name__}: {e}",flush=True)
@@ -1774,7 +1832,7 @@ def stats_api():
     if val is None:
         val={"n":0,"hit24":0.0,"err24":0.0,"hitMain":0.0,"errMain":0.0,
              "hitZ":0.0,"errZ":0.0,"hitPingte":0.0,"errPingte":0.0,
-             "profile":model_state.get("profile") or "平衡","building":True}
+             "profile":model_state.get("profile") or "平衡","building":True,"n":0}
         if not background_state.get("stats_building"):
             threading.Thread(target=_build_stats_background,daemon=True,name="stats-builder").start()
     return jsonify(val)
