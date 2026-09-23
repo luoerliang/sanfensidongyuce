@@ -106,6 +106,10 @@ box-shadow:0 12px 30px #0007;opacity:0;pointer-events:none;transition:.2s;z-inde
 .zpairCodes{display:flex;gap:4px;justify-content:center;flex-wrap:wrap}
 .microball{width:25px;height:25px;border-radius:50%;display:flex;align-items:center;justify-content:center;color:#fff;font-size:10px;font-weight:900}
 .trendGrid{display:grid;grid-template-columns:repeat(3,1fr);gap:7px}
+.strategyGrid{display:grid;grid-template-columns:repeat(2,1fr);gap:7px}
+.strategyBox{background:#0c1421;border:1px solid #1f2d43;border-radius:14px;padding:10px}
+.strategyTitle{font-size:10px;color:#8f9cb0;margin-bottom:6px}
+.strategyMain{font-size:13px;font-weight:850;line-height:1.55}
 .trendBox{background:#0c1421;border:1px solid #1f2d43;border-radius:14px;padding:10px}
 .trendTitle{font-size:10px;color:#8f9cb0;margin-bottom:6px}
 .trendMain{font-size:13px;font-weight:850;line-height:1.55}
@@ -167,7 +171,7 @@ box-shadow:0 12px 30px #0007;opacity:0;pointer-events:none;transition:.2s;z-inde
     <div class="sectionHead">
       <div>
         <div class="sectionTitle">24个动态特码</div>
-        <div class="sectionHint">每期重算 · 升序</div>
+        <div class="sectionHint">12肖×2码 · 每期重算 · 升序</div>
       </div>
       <button class="copyBtn" onclick="copySpecial()">一键复制</button>
     </div>
@@ -183,17 +187,9 @@ box-shadow:0 12px 30px #0007;opacity:0;pointer-events:none;transition:.2s;z-inde
   <section class="card">
     <div class="sectionHead">
       <div class="sectionTitle">4肖 · 一肖一码</div>
-      <div class="sectionHint">4肖与4个主码严格一一对应</div>
+      <div class="sectionHint">每期重算 · 4肖与4码严格一一对应</div>
     </div>
     <div id="zpair" class="zpairGrid"></div>
-  </section>
-
-  <section class="card">
-    <div class="sectionHead">
-      <div class="sectionTitle">24码 · 12肖分配</div>
-      <div class="sectionHint">每肖1–3个近期综合分最高码</div>
-    </div>
-    <div id="zgroups" class="zpairGrid"></div>
   </section>
 
   <section class="card">
@@ -207,6 +203,31 @@ box-shadow:0 12px 30px #0007;opacity:0;pointer-events:none;transition:.2s;z-inde
       <div class="trendBox"><div class="trendTitle">单双走势</div><div id="parityTrend" class="trendMain">--</div></div>
     </div>
     <div class="pillrow"><span id="profileInfo" class="pill"></span></div>
+  </section>
+
+  <section class="card">
+    <div class="sectionHead">
+      <div class="sectionTitle">冷热 · 头数策略</div>
+      <div class="sectionHint">历史条件成立才启用</div>
+    </div>
+    <div class="strategyGrid">
+      <div class="strategyBox">
+        <div class="strategyTitle">冷码防守</div>
+        <div id="coldSignal" class="strategyMain">--</div>
+      </div>
+      <div class="strategyBox">
+        <div class="strategyTitle">冷肖观察</div>
+        <div id="coldZodiac" class="strategyMain">--</div>
+      </div>
+      <div class="strategyBox">
+        <div class="strategyTitle">0头 / 4头</div>
+        <div id="headSignal" class="strategyMain">--</div>
+      </div>
+      <div class="strategyBox">
+        <div class="strategyTitle">牛马羊条件验证</div>
+        <div id="nmySignal" class="strategyMain">--</div>
+      </div>
+    </div>
   </section>
 
   <section class="card">
@@ -227,7 +248,7 @@ box-shadow:0 12px 30px #0007;opacity:0;pointer-events:none;transition:.2s;z-inde
   </section>
 
   <div id="toast" class="toast">已复制</div>
-  <div class="foot">号码颜色按红 / 蓝 / 绿波显示。新版把波色、生肖、大小、单双作为近期统计特征参与动态评分；命中率使用独立历史验证窗口计算，不代表未来中奖概率；程序不会为了显示70%而伪造或泄漏未来数据。</div>
+  <div class="foot">号码颜色按红 / 蓝 / 绿波显示。新版把波色、生肖、大小、单双作为近期统计特征参与动态评分；冷热、牛马羊条件、头数判断都必须由历史样本支持才启用；所谓“杀头”只做降权，不会硬删整头。命中率使用独立历史验证窗口，不代表未来中奖概率。</div>
 </div>
 
 <script>
@@ -266,11 +287,6 @@ async function loadMain(){
       <div class="zpairName">${p.zodiac}</div>
       <div class="zpairCodes"><span class="microball ${cls(p.code)}">${p.code}</span></div>
     </div>`).join('');
-    const groups=d.zodiac_groups||[];
-    zgroups.innerHTML=groups.map(g=>`<div class="zpair">
-      <div class="zpairName">${g.zodiac}</div>
-      <div class="zpairCodes">${(g.codes||[]).map(n=>`<span class="microball ${cls(n)}">${n}</span>`).join('')}</div>
-    </div>`).join('');
     const tr=d.trend||{};
     const w=tr.wave||{}, sz=tr.size||{}, pa=tr.parity||{};
     waveTrend.innerHTML=`红 ${w['红']??0}%<br>蓝 ${w['蓝']??0}%<br>绿 ${w['绿']??0}%`;
@@ -278,10 +294,15 @@ async function loadMain(){
     parityTrend.innerHTML=`单 ${pa['单']??0}%<br>双 ${pa['双']??0}%`;
     const ps=d.profile_scores||{};
     profileInfo.textContent=`当前模型 ${d.profile||'--'} · 最近校准分 ${ps[d.profile]??0}%`;
+    const sg=d.strategy||{};
+    coldSignal.innerHTML=sg.cold_rebound_now?'冷反弹信号：启用<br>24码允许热+冷防守':'冷反弹信号：普通<br>仍以热码为主';
+    coldZodiac.innerHTML=(sg.cold_zodiacs||[]).length?`偏冷：${sg.cold_zodiacs.join('、')}`:'暂无';
+    headSignal.innerHTML=sg.head_advice||'暂无';
+    nmySignal.innerHTML=`样本 ${sg.nmy_samples??0}<br>条件 ${sg.nmy_conditional_pct??0}% / 基准 ${sg.nmy_baseline_pct??0}%`;
     latestZodiac.textContent=d.latest_special_zodiac?`特码生肖 ${d.latest_special_zodiac}`:'特码生肖 --';
     lastIngest.textContent=d.latest_created_at?`最后录入 ${d.latest_created_at}`:'实时录入';
     tg.textContent=d.telegram?'Telegram 已连接':'Telegram 未配置';
-    adaptiveInfo.textContent=`自动校准：${d.profile||'--'} · 24码按12肖分层`;
+    adaptiveInfo.textContent=`自动校准：${d.profile||'--'} · 24码=每肖2码 · 4肖1码每期重算`;
     calcState.textContent=d.recalculating?'新期开奖已入库 · 模型重算中':'模型已更新';
     calcState.className=d.recalculating?'pill':'pill ok';
 
@@ -738,80 +759,282 @@ def _number_scores_profile(r, profile):
         score[n]+=.11*p["omit"]*min(last[n],50)/50.0
     return score
 
+def head_of(n):
+    if 1 <= n <= 9: return "0头"
+    if 10 <= n <= 19: return "1头"
+    if 20 <= n <= 29: return "2头"
+    if 30 <= n <= 39: return "3头"
+    return "4头"
+
+HEAD_BASE = {"0头":9/49,"1头":10/49,"2头":10/49,"3头":10/49,"4头":10/49}
+
+def _cold_metrics(r):
+    """Current omission/coldness for numbers and zodiacs."""
+    num_gap={n:len(r) for n in range(1,50)}
+    z_gap={z:len(r) for z in ALL_ZODIACS}
+
+    for i,x in enumerate(r):
+        n=x["special"]
+        if num_gap[n]==len(r):
+            num_gap[n]=i
+        z=normalize_z(x["z7"] or "")
+        if z in z_gap and z_gap[z]==len(r):
+            z_gap[z]=i
+
+    # Recent occurrence rates.
+    c12=Counter(x["special"] for x in r[:12])
+    c36=Counter(x["special"] for x in r[:36])
+    z12=Counter(normalize_z(x["z7"] or "") for x in r[:12] if x["z7"])
+    z36=Counter(normalize_z(x["z7"] or "") for x in r[:36] if x["z7"])
+
+    num_cold={}
+    for n in range(1,50):
+        gap=min(num_gap[n],40)/40.0
+        scarcity=1.0-min(c12[n]/max(1,12/49),1.8)/1.8
+        medium=1.0-min(c36[n]/max(1,36/49),1.8)/1.8
+        num_cold[n]=0.55*gap+0.30*scarcity+0.15*medium
+
+    z_cold={}
+    for z in ALL_ZODIACS:
+        gap=min(z_gap[z],24)/24.0
+        scarcity=1.0-min(z12[z]/max(1,12/12),1.8)/1.8
+        medium=1.0-min(z36[z]/max(1,36/12),1.8)/1.8
+        z_cold[z]=0.55*gap+0.30*scarcity+0.15*medium
+
+    return num_cold,z_cold,num_gap,z_gap
+
+def _nmy_cold_rebound_lift(r, lookback=600, cold_window=12):
+    """Empirically test the user's '牛/马/羊后冷码' idea.
+    A transition counts as a cold rebound if the next special had not appeared
+    in the preceding cold_window special draws. Returns conditional lift vs all transitions."""
+    nmy={"牛","马","羊"}
+    maxj=min(len(r)-cold_window-2, lookback)
+    if maxj <= 20:
+        return {"samples":0,"conditional":0.0,"baseline":0.0,"lift":0.0,"active":False}
+
+    cond_hits=cond_n=base_hits=base_n=0
+    for j in range(maxj):
+        outcome=r[j]["special"]
+        prior_z=normalize_z(r[j+1]["z7"] or "")
+        older=[r[k]["special"] for k in range(j+2,min(j+2+cold_window,len(r)))]
+        is_cold = outcome not in older
+        base_n += 1
+        base_hits += int(is_cold)
+        if prior_z in nmy:
+            cond_n += 1
+            cond_hits += int(is_cold)
+
+    baseline=base_hits/base_n if base_n else 0.0
+    conditional=cond_hits/cond_n if cond_n else 0.0
+    lift=conditional-baseline
+    active=cond_n>=18 and lift>=0.07
+    return {
+      "samples":cond_n,
+      "conditional":round(conditional,3),
+      "baseline":round(baseline,3),
+      "lift":round(lift,3),
+      "active":active
+    }
+
+def _head_trend(r):
+    """Head-number strength normalized by theoretical head sizes.
+    Returns weak-head guidance; algorithm only downweights, never hard-excludes."""
+    cfg=[(8,3,1.55),(16,5,1.25),(36,11,.90),(80,25,.55)]
+    score={h:0.0 for h in HEAD_BASE}
+    totalcoef=sum(c for _,_,c in cfg)
+    sp=[x["special"] for x in r]
+
+    for horizon,half,coef in cfg:
+        wsum=0.0
+        tmp=defaultdict(float)
+        for i,n in enumerate(sp[:min(horizon,len(sp))]):
+            w=exp_weight(i,half)
+            tmp[head_of(n)] += w
+            wsum += w
+        for h in HEAD_BASE:
+            share=(tmp[h]/wsum) if wsum else 0.0
+            # Normalize by theoretical probability so 0头 isn't unfairly penalized.
+            score[h] += coef*(share/HEAD_BASE[h])
+
+    for h in score:
+        score[h] /= totalcoef
+
+    # Acceleration: last 8 vs previous 24.
+    a=Counter(head_of(x["special"]) for x in r[:8])
+    b=Counter(head_of(x["special"]) for x in r[8:32])
+    for h in score:
+        recent=a[h]/max(1,min(8,len(r)))
+        prev=b[h]/max(1,min(24,max(0,len(r)-8)))
+        score[h] += 0.55*(recent-prev)/HEAD_BASE[h]
+
+    ranked=sorted(score,key=lambda h:(score[h],h))
+    weakest=ranked[0]
+    weak04=min(["0头","4头"],key=lambda h:score[h])
+    weak04_strength=score[weak04]
+    # Only call it a "kill/downweight" signal if it is meaningfully weak.
+    if weak04_strength < 0.72:
+        advice=f"{weak04}偏弱（降权）"
+        active=weak04
+    else:
+        advice="0头/4头暂无明显弱势"
+        active=""
+    return {
+      "strength":{h:round(score[h],2) for h in score},
+      "weakest":weakest,
+      "active_04":active,
+      "advice":advice
+    }
+
+def _strategy_context(r):
+    num_cold,z_cold,num_gap,z_gap=_cold_metrics(r)
+    rebound=_nmy_cold_rebound_lift(r)
+    head=_head_trend(r)
+    latest_z=normalize_z(r[0]["z7"] or "") if r else ""
+    nmy_now=latest_z in {"牛","马","羊"}
+    cold_rebound_now=bool(nmy_now and rebound["active"])
+    cold_zodiacs=sorted(ALL_ZODIACS,key=lambda z:(-z_cold.get(z,0),z))[:3]
+    return {
+      "num_cold":num_cold,
+      "z_cold":z_cold,
+      "num_gap":num_gap,
+      "z_gap":z_gap,
+      "nmy_rebound":rebound,
+      "latest_zodiac":latest_z,
+      "cold_rebound_now":cold_rebound_now,
+      "cold_zodiacs":cold_zodiacs,
+      "head":head
+    }
+
+def _hot_number_score_by_zodiac(r, profile, ctx=None):
+    """Dynamic hot/cold blended score.
+    Hot frequency dominates; cold-rebound and weak-head factors only modify it
+    when the data supports those signals."""
+    p=PROFILE_LIBRARY[profile]
+    score={n:0.0 for n in range(1,50)}
+    trend=_trend_profiles(r)
+    ctx=ctx or _strategy_context(r)
+
+    # Recent occurrence score.
+    for horizon,half,coef in [(6,2,2.40),(12,4,2.00),(24,8,1.55),(60,18,1.00),(120,38,.55)]:
+        for i,x in enumerate(r[:min(horizon,len(r))]):
+            w=coef*exp_weight(i,half)
+            score[x["special"]] += 1.85*w
+            for j in range(1,7):
+                score[x[f"n{j}"]] += .62*w
+
+    # Acceleration.
+    now=Counter(); old=Counter()
+    for x in r[:6]:
+        now[x["special"]]+=1.8
+        for j in range(1,7): now[x[f"n{j}"]]+=.55
+    for x in r[6:24]:
+        old[x["special"]]+=1.8
+        for j in range(1,7): old[x[f"n{j}"]]+=.55
+
+    weak04=ctx["head"].get("active_04","")
+    for n in range(1,50):
+        score[n] += 1.10*p["accel"]*(now[n]/6.0-old[n]/18.0)
+        score[n] += .35*p["wave"]*trend["wave"].get(wave_of(n),0)
+        score[n] += .22*p["size"]*trend["size"].get(size_of(n),0)
+        score[n] += .20*p["parity"]*trend["parity"].get(parity_of(n),0)
+
+        # Cold-code defense: normally small. After 牛/马/羊, only becomes stronger
+        # if historical transitions actually show a meaningful cold-rebound lift.
+        cold=ctx["num_cold"].get(n,0)
+        if ctx["cold_rebound_now"]:
+            score[n] += 1.05*cold
+        else:
+            score[n] += .22*cold
+
+        # "Kill head" is implemented as a downweight, never a hard deletion.
+        if weak04 and head_of(n)==weak04:
+            score[n] -= .85
+
+    return score
+
 def _candidate24_by_zodiac(r, profile):
-    """Exactly 24 candidates. Every zodiac gets 1-3 codes, selected by score."""
+    """Exactly 24 = 12 zodiacs × 2 codes.
+    Default: two hottest codes. When a validated cold-rebound signal is active,
+    a zodiac may use one hot + one cold-defense code if that code is competitive."""
     zmap=_number_zodiac_map(r)
-    ns=_number_scores_profile(r,profile)
-    zs=_zodiac_scores_profile(r,profile)
+    ctx=_strategy_context(r)
+    ns=_hot_number_score_by_zodiac(r,profile,ctx)
 
     pools={z:[] for z in ALL_ZODIACS}
     for n in range(1,50):
         z=zmap.get(n)
         if z in pools:
             pools[z].append(n)
-    for z in pools:
-        pools[z]=sorted(pools[z],key=lambda n:(-ns[n],n))
 
-    # Ensure every zodiac has at least one pool member; history normally covers all.
-    missing=[z for z in ALL_ZODIACS if not pools[z]]
-    unassigned=[n for n in range(1,50) if zmap.get(n) not in pools]
-    for z,n in zip(missing,unassigned):
-        pools[z]=[n]
-
-    quota={z:(1 if pools[z] else 0) for z in ALL_ZODIACS}
-    remaining=24-sum(quota.values())
-
-    # Allocate the extra 12 spots by zodiac trend + marginal next-number score.
-    while remaining>0:
-        options=[]
-        for z in ALL_ZODIACS:
-            q=quota[z]
-            if q>=3 or q>=len(pools[z]): continue
-            nextn=pools[z][q]
-            zbase=zs.get(z,0)
-            marginal=ns[nextn]+.018*zbase
-            options.append((marginal,z))
-        if not options: break
-        _,best=max(options,key=lambda t:(t[0],t[1]))
-        quota[best]+=1
-        remaining-=1
-
-    groups=[]
-    selected=[]
+    groups=[]; selected=[]; used=set()
     for z in ALL_ZODIACS:
-        codes=pools[z][:quota[z]]
+        hot_rank=sorted(pools[z],key=lambda n:(-ns[n],n))
+        codes=hot_rank[:2]
+
+        # Cold defense only if supported by current context.
+        if ctx["cold_rebound_now"] and len(hot_rank)>=3:
+            cold_rank=sorted(
+                pools[z],
+                key=lambda n:(-ctx["num_cold"].get(n,0), -ns[n], n)
+            )
+            cold_choice=cold_rank[0]
+            # Replace weaker of the 2 only if cold candidate still has reasonable score.
+            if cold_choice not in codes and ns[cold_choice] >= ns[codes[-1]]-0.65:
+                codes=[codes[0],cold_choice]
+
         groups.append({"zodiac":z,"codes":codes})
-        selected.extend(codes)
+        for n in codes:
+            if n not in used:
+                selected.append(n); used.add(n)
 
-    # Fallback: if mapping gaps left us short, fill by global score without duplicates.
+    # Defensive fallback to exactly 24.
     if len(selected)<24:
-        for n in sorted(range(1,50),key=lambda n:(-ns[n],n)):
-            if n not in selected:
-                selected.append(n)
+        global_rank=sorted(range(1,50),key=lambda n:(-ns[n],n))
+        for n in global_rank:
+            if n not in used:
+                selected.append(n); used.add(n)
             if len(selected)>=24: break
-    elif len(selected)>24:
-        selected=sorted(selected,key=lambda n:(-ns[n],n))[:24]
 
-    return selected,groups,ns,zs
+    return selected[:24],groups,ns,_zodiac_scores_profile(r,profile),ctx
 
-def _predict_with_profile(r, profile):
-    cand24,groups,ns,zs=_candidate24_by_zodiac(r,profile)
-    z4=sorted(ALL_ZODIACS,key=lambda z:(-zs.get(z,-1e9),z))[:4]
+def _dynamic_zodiac4_one_code(r, profile, groups, ns, zs, ctx):
+    """4肖一肖一码. Recomputed every issue from trend + cold rebound + momentum."""
+    if not r:
+        return [],[]
 
-    # Exactly one main code under each selected zodiac, and it must be inside the 24.
+    prev_zs=_zodiac_scores_profile(r[1:],profile) if len(r)>1 else {}
+    latest_z=normalize_z(r[0]["z7"] or "")
+
+    adjusted={}
+    for z in ALL_ZODIACS:
+        momentum=zs.get(z,0)-prev_zs.get(z,0)
+        adjusted[z]=zs.get(z,0)+1.35*momentum
+
+        # Cold-zodiac defense gets a modest boost, stronger only in validated NMY phase.
+        cold=ctx["z_cold"].get(z,0)
+        adjusted[z] += (.85 if ctx["cold_rebound_now"] else .18)*cold
+
+        # Reduce immediate repeat slightly so 4肖 can respond each period without random rotation.
+        if z==latest_z:
+            adjusted[z]-=.16*max(abs(zs.get(z,0)),1.0)
+
+    z4=sorted(ALL_ZODIACS,key=lambda z:(-adjusted.get(z,-1e9),z))[:4]
     groupmap={g["zodiac"]:g["codes"] for g in groups}
-    main4=[]
-    zpair=[]
+
+    pairs=[]; main4=[]
     for z in z4:
         codes=groupmap.get(z,[])
         if codes:
-            main=max(codes,key=lambda n:(ns[n],-n))
-        else:
-            pool=[n for n in cand24 if _number_zodiac_map(r).get(n)==z]
-            main=max(pool,key=lambda n:(ns[n],-n)) if pool else max(cand24,key=lambda n:(ns[n],-n))
-        main4.append(main)
-        zpair.append({"zodiac":z,"code":main})
-    return cand24,main4,z4,groups,zpair
+            code=max(codes,key=lambda n:(ns.get(n,-1e9),-n))
+            main4.append(code)
+            pairs.append({"zodiac":z,"code":code})
+    return z4,pairs
+
+def _predict_with_profile(r, profile):
+    cand24,groups,ns,zs,ctx=_candidate24_by_zodiac(r,profile)
+    z4,zpairs=_dynamic_zodiac4_one_code(r,profile,groups,ns,zs,ctx)
+    main4=[p["code"] for p in zpairs]
+    return cand24,main4,z4,groups,zpairs
 
 def _profile_score_on_recent(r, profile, samples=28):
     if len(r)<260:
@@ -906,10 +1129,11 @@ def build_model():
     model_state["recalc_started_at"]=time.strftime("%Y-%m-%d %H:%M:%S")
     r=all_rows()
     if not r:
-        return {"issue":None,"count":0,"special24":[],"main4":[],"zodiac4":[],"zodiac_groups":[],"zodiac_pairs":[],"telegram":bool(BOT_TOKEN),"recalculating":False}
+        return {"issue":None,"count":0,"special24":[],"main4":[],"zodiac4":[],"zodiac_pairs":[],"telegram":bool(BOT_TOKEN),"recalculating":False}
     profile,profile_scores=_select_profile(r)
     c24,m4,z4,groups,zpairs=_predict_with_profile(r,profile)
     trend=_trend_profiles(r)
+    strategy=_strategy_context(r)
     latest=r[0]
     latest_numbers=[latest[f"n{i}"] for i in range(1,7)]+[latest["special"]]
     try: next_issue=str(int(latest["issue"])+1)
@@ -923,9 +1147,19 @@ def build_model():
       "main4":[f"{n:02d}" for n in m4],
       "zodiac4":z4,
       "zodiac_pairs":[{"zodiac":p["zodiac"],"code":f"{p['code']:02d}"} for p in zpairs],
-      "zodiac_groups":[{"zodiac":g["zodiac"],"codes":[f"{n:02d}" for n in g["codes"]]} for g in groups],
       "profile":profile,
       "profile_scores":profile_scores,
+      "strategy":{
+        "cold_rebound_now":strategy["cold_rebound_now"],
+        "cold_zodiacs":strategy["cold_zodiacs"],
+        "latest_zodiac":strategy["latest_zodiac"],
+        "nmy_samples":strategy["nmy_rebound"]["samples"],
+        "nmy_conditional_pct":round(strategy["nmy_rebound"]["conditional"]*100,1),
+        "nmy_baseline_pct":round(strategy["nmy_rebound"]["baseline"]*100,1),
+        "nmy_lift_pct":round(strategy["nmy_rebound"]["lift"]*100,1),
+        "head_advice":strategy["head"]["advice"],
+        "head_strength":strategy["head"]["strength"]
+      },
       "trend":{
         "wave":{k:round(v*100,1) for k,v in trend["wave"].items()},
         "size":{k:round(v*100,1) for k,v in trend["size"].items()},
