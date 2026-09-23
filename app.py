@@ -30,6 +30,24 @@ model_state = {
     "recalc_started_at": "",
     "recalc_finished_at": ""
 }
+background_state = {
+    "profile_calibrating": False,
+    "stats_building": False,
+    "boot_ready": False
+}
+
+long_prior_lock = threading.RLock()
+long_prior = {
+    "ready": False,
+    "building": False,
+    "total": 0,
+    "num_count": Counter(),
+    "zodiac_count": Counter(),
+    "trans_num_by_zodiac": defaultdict(Counter),
+    "trans_zodiac_by_zodiac": defaultdict(Counter),
+    "updated_at": ""
+}
+
 
 history_cache = {"total": 0, "items": [], "loaded_at": ""}
 history_cache_lock = threading.RLock()
@@ -142,7 +160,7 @@ box-shadow:0 12px 30px #0007;opacity:0;pointer-events:none;transition:.2s;z-inde
     <div class="livebox"><span class="dot"></span><span>实时录入</span></div>
     <div style="text-align:right">
       <div class="title">三分彩 · 智能看板</div>
-      <div class="subtitle">TG自动入库 · 开奖先秒显 · 模型后台重算</div>
+      <div class="subtitle">TG自动入库 · 开奖秒显 · 极速窗口预测</div>
     </div>
   </div>
 
@@ -253,7 +271,7 @@ box-shadow:0 12px 30px #0007;opacity:0;pointer-events:none;transition:.2s;z-inde
   </section>
 
   <section class="card">
-    <div class="sectionHead"><div class="sectionTitle">近60期滚动回测</div><div class="sectionHint">命中 / 错误</div></div>
+    <div class="sectionHead"><div class="sectionTitle">滚动回测（后台更新）</div><div class="sectionHint">命中 / 错误</div></div>
     <div class="stats">
       <div class="stat"><div class="statName">24码</div><div id="hit22" class="rate">--</div><div id="err22" class="err"></div></div>
       <div class="stat"><div class="statName">4肖1码</div><div id="hit4" class="rate">--</div><div id="err4" class="err"></div></div>
@@ -321,7 +339,7 @@ async function loadMain(){
     profileInfo.textContent=`当前模型 ${d.profile||'--'} · 最近校准分 ${ps[d.profile]??0}%`;
     const fc=d.forecast||{};
     forecastTarget.textContent=fc.target_issue?`预测 ${fc.target_issue} 期`:'--';
-    forecastMode.innerHTML=`${fc.mode||'前瞻预测'}<br>转移样本 ${fc.transition_samples??0}`;
+    forecastMode.innerHTML=`${fc.mode||'前瞻预测'}<br>转移样本 ${fc.transition_samples??0} · 全历史 ${fc.long_prior_ready?'已缓存':'后台加载'}`;
     const sg=d.strategy||{};
     coldSignal.innerHTML=sg.cold_rebound_now?'冷反弹信号：启用<br>24码允许热+冷防守':'冷反弹信号：普通<br>仍以热码为主';
     coldZodiac.innerHTML=(sg.cold_zodiacs||[]).length?`偏冷：${sg.cold_zodiacs.join('、')}`:'暂无';
@@ -340,10 +358,17 @@ async function loadStats(){
   try{
     const r=await fetch('/api/stats?_='+Date.now(),{cache:'no-store'});
     const st=await r.json();
-    hit22.textContent=(st.hit24??0).toFixed(1)+'%'; err22.textContent='错误 '+(st.err24??0).toFixed(1)+'%';
-    hit4.textContent=(st.hitMain??0).toFixed(1)+'%'; err4.textContent='错误 '+(st.errMain??0).toFixed(1)+'%';
-    hitZ.textContent=(st.hitZ??0).toFixed(1)+'%'; errZ.textContent='错误 '+(st.errZ??0).toFixed(1)+'%';
-    hitPingte.textContent=(st.hitPingte??0).toFixed(1)+'%'; errPingte.textContent='错误 '+(st.errPingte??0).toFixed(1)+'%';
+    if(st.building){
+      hit22.textContent='计算中'; err22.textContent='';
+      hit4.textContent='计算中'; err4.textContent='';
+      hitZ.textContent='计算中'; errZ.textContent='';
+      hitPingte.textContent='计算中'; errPingte.textContent='';
+    }else{
+      hit22.textContent=(st.hit24??0).toFixed(1)+'%'; err22.textContent='错误 '+(st.err24??0).toFixed(1)+'%';
+      hit4.textContent=(st.hitMain??0).toFixed(1)+'%'; err4.textContent='错误 '+(st.errMain??0).toFixed(1)+'%';
+      hitZ.textContent=(st.hitZ??0).toFixed(1)+'%'; errZ.textContent='错误 '+(st.errZ??0).toFixed(1)+'%';
+      hitPingte.textContent=(st.hitPingte??0).toFixed(1)+'%'; errPingte.textContent='错误 '+(st.errPingte??0).toFixed(1)+'%';
+    }
   }catch(e){}
 }
 async function loadHistory(){
@@ -592,6 +617,7 @@ def _patch_live_cache_latest(issue, nums, zs):
 
 def add_draw(issue,nums,zs,colors,raw):
     if len(nums)!=7 or len(set(nums))!=7 or not all(1<=x<=49 for x in nums): return False
+    prev_before_insert=latest_row()
     with db_lock:
         c=connect()
         before=c.total_changes
@@ -603,6 +629,7 @@ def add_draw(issue,nums,zs,colors,raw):
         changed=c.total_changes>before
         c.close()
         if changed:
+            update_long_prior_incremental(prev_before_insert, nums, zs)
             stats_cache["issue"]=None
             stats_cache["value"]=None
             _patch_live_cache_latest(issue, nums, zs)
@@ -617,6 +644,122 @@ def all_rows():
         finally:
             c.close()
     return _db_retry(_read)
+
+def recent_rows(limit=1200):
+    """Read only the recent history needed by the live predictor."""
+    def _read():
+        c=connect()
+        try:
+            return c.execute("""SELECT * FROM draws
+                                ORDER BY CAST(issue AS INTEGER) DESC
+                                LIMIT ?""",(int(limit),)).fetchall()
+        finally:
+            c.close()
+    return _db_retry(_read)
+
+def build_long_prior():
+    """Build full-history priors once in the background.
+    Live predictions never wait for this."""
+    with long_prior_lock:
+        if long_prior["building"]:
+            return
+        long_prior["building"] = True
+    t0=time.time()
+    try:
+        rows=all_rows()  # one background scan of the full DB
+        num_count=Counter()
+        zodiac_count=Counter()
+        trans_num=defaultdict(Counter)
+        trans_z=defaultdict(Counter)
+
+        for x in rows:
+            n=x["special"]
+            z=normalize_z(x["z7"] or "")
+            if n:
+                num_count[n]+=1
+            if z:
+                zodiac_count[z]+=1
+
+        # rows newest -> oldest. state rows[j] -> next outcome rows[j-1]
+        for j in range(1,len(rows)):
+            state=rows[j]
+            outcome=rows[j-1]
+            sz=normalize_z(state["z7"] or "")
+            on=outcome["special"]
+            oz=normalize_z(outcome["z7"] or "")
+            if sz and on:
+                trans_num[sz][on]+=1
+            if sz and oz:
+                trans_z[sz][oz]+=1
+
+        with long_prior_lock:
+            long_prior["num_count"]=num_count
+            long_prior["zodiac_count"]=zodiac_count
+            long_prior["trans_num_by_zodiac"]=trans_num
+            long_prior["trans_zodiac_by_zodiac"]=trans_z
+            long_prior["total"]=len(rows)
+            long_prior["ready"]=True
+            long_prior["updated_at"]=time.strftime("%Y-%m-%d %H:%M:%S")
+        print(f"[PRIOR] full-history prior ready rows={len(rows)} in {time.time()-t0:.2f}s",flush=True)
+    except Exception as e:
+        print(f"[PRIOR] failed: {type(e).__name__}: {e}",flush=True)
+    finally:
+        with long_prior_lock:
+            long_prior["building"]=False
+
+def update_long_prior_incremental(prev_row, nums, zs):
+    """O(1) update after each new draw; no full rescan."""
+    with long_prior_lock:
+        if not long_prior["ready"]:
+            return
+        new_special=int(nums[6])
+        new_z=normalize_z(zs[6] if len(zs)>=7 else "")
+        long_prior["num_count"][new_special]+=1
+        if new_z:
+            long_prior["zodiac_count"][new_z]+=1
+        if prev_row is not None:
+            prev_z=normalize_z(prev_row["z7"] or "")
+            if prev_z:
+                long_prior["trans_num_by_zodiac"][prev_z][new_special]+=1
+                if new_z:
+                    long_prior["trans_zodiac_by_zodiac"][prev_z][new_z]+=1
+        long_prior["total"]+=1
+        long_prior["updated_at"]=time.strftime("%Y-%m-%d %H:%M:%S")
+
+def _long_prior_bonus(r):
+    """Return tiny, stable full-history priors as normalized 0..1 scores."""
+    num_bonus=defaultdict(float)
+    z_bonus=defaultdict(float)
+    if not r:
+        return num_bonus,z_bonus,False
+
+    with long_prior_lock:
+        if not long_prior["ready"]:
+            return num_bonus,z_bonus,False
+        numc=Counter(long_prior["num_count"])
+        latest_z=normalize_z(r[0]["z7"] or "")
+        trans_num=Counter(long_prior["trans_num_by_zodiac"].get(latest_z,{}))
+        trans_z=Counter(long_prior["trans_zodiac_by_zodiac"].get(latest_z,{}))
+
+    def normalize_counter(c, keys):
+        vals=[c.get(k,0) for k in keys]
+        if not vals:
+            return {}
+        lo=min(vals); hi=max(vals)
+        if hi==lo:
+            return {k:.5 for k in keys}
+        return {k:(c.get(k,0)-lo)/(hi-lo) for k in keys}
+
+    base=normalize_counter(numc, range(1,50))
+    trn=normalize_counter(trans_num, range(1,50))
+    trz=normalize_counter(trans_z, ALL_ZODIACS)
+    for n in range(1,50):
+        # Long history is a stabilizer, not the driver.
+        num_bonus[n]=.42*base.get(n,.5)+.58*trn.get(n,.5)
+    for z in ALL_ZODIACS:
+        z_bonus[z]=trz.get(z,.5)
+    return num_bonus,z_bonus,True
+
 
 def refresh_history_cache(limit=500):
     def _read():
@@ -652,6 +795,9 @@ def refresh_all_caches():
         rebuild_live_cache()
     except Exception as e:
         print(f"[CACHE] model refresh failed: {type(e).__name__}: {e}",flush=True)
+    # Backtest is never part of the critical update path.
+    # Stats are deliberately not started here; /api/stats will start them lazily
+    # after the live forecast is already available.
 
 def exp_weight(i,half_life):
     return 0.5 ** (i/max(half_life,1))
@@ -710,7 +856,7 @@ def _trend_profiles(r):
 
 def _number_zodiac_map(r):
     counts={n:Counter() for n in range(1,50)}
-    for x in r[:min(600,len(r))]:
+    for x in r[:min(300,len(r))]:
         for j in range(1,7):
             n=x[f"n{j}"]; z=normalize_z(x[f"z{j}"] or "")
             if n and z: counts[n][z]+=1
@@ -840,7 +986,7 @@ def _cold_metrics(r):
 
     return num_cold,z_cold,num_gap,z_gap
 
-def _nmy_cold_rebound_lift(r, lookback=600, cold_window=12):
+def _nmy_cold_rebound_lift(r, lookback=300, cold_window=12):
     """Empirically test the user's '牛/马/羊后冷码' idea.
     A transition counts as a cold rebound if the next special had not appeared
     in the preceding cold_window special draws. Returns conditional lift vs all transitions."""
@@ -969,7 +1115,7 @@ def _forward_transition_scores(r):
     samples=0
     exact_samples=0
     # r is newest -> oldest. Historical transition: r[j] (state) -> r[j-1] (next outcome).
-    maxj=min(len(r)-1,1800)
+    maxj=min(len(r)-1,700)
     for j in range(1,maxj):
         prev=r[j]
         out=r[j-1]
@@ -1123,7 +1269,7 @@ def _tail_transition_score(r):
     if len(r)<80:
         return out
     cur_tail=r[0]["special"] % 10
-    for j in range(1,min(len(r)-1,1600)):
+    for j in range(1,min(len(r)-1,700)):
         state=r[j]["special"]
         nxt=r[j-1]["special"]
         if state % 10 == cur_tail:
@@ -1145,6 +1291,7 @@ def _predictive_number_scores(r, profile, ctx=None):
     hazard=_gap_hazard_profile(r)
     tail_t=_tail_transition_score(r)
     blend=FORECAST_BLEND.get(profile,FORECAST_BLEND["平衡"])
+    long_num,long_z,long_ready=_long_prior_bonus(r)
 
     weak04=ctx["head"].get("active_04","")
     latest_n=r[0]["special"] if r else None
@@ -1157,6 +1304,8 @@ def _predictive_number_scores(r, profile, ctx=None):
         score[n] += .50*par_t[parity_of(n)]
         score[n] += blend["hazard"]*hazard.get(n,.5)
         score[n] += blend["tail"]*tail_t[n]
+        if long_ready:
+            score[n] += .48*long_num[n]
 
         cold=ctx["num_cold"].get(n,0)
         score[n] += (0.72 if ctx["cold_rebound_now"] else 0.10)*cold
@@ -1219,11 +1368,14 @@ def _dynamic_zodiac4_one_code(r, profile, groups, ns, zs, ctx, ztrans):
     prev_zs=_zodiac_scores_profile(r[1:],profile) if len(r)>1 else {}
     latest_z=normalize_z(r[0]["z7"] or "")
 
+    _ln,long_z,long_ready=_long_prior_bonus(r)
     adjusted={}
     for z in ALL_ZODIACS:
         momentum=zs.get(z,0)-prev_zs.get(z,0)
         adjusted[z]=zs.get(z,0)+1.05*momentum
         adjusted[z]+=1.50*ztrans[z]
+        if long_ready:
+            adjusted[z]+=.55*long_z[z]
         adjusted[z]+=(.72 if ctx["cold_rebound_now"] else .12)*ctx["z_cold"].get(z,0)
 
         # Small anti-chase cooldown. Historical transition can overcome it.
@@ -1285,7 +1437,7 @@ def _pingte_yixiao_scores(r):
 
     trans=defaultdict(float)
     samples=0
-    for j in range(1,min(len(r)-1,1800)):
+    for j in range(1,min(len(r)-1,700)):
         state=r[j]
         outcome=r[j-1]
         match=0.0
@@ -1317,6 +1469,10 @@ def _pingte_yixiao_scores(r):
 
 def _predict_pingte_yixiao(r):
     scores,meta=_pingte_yixiao_scores(r)
+    _ln,long_z,long_ready=_long_prior_bonus(r)
+    if long_ready:
+        for z in ALL_ZODIACS:
+            scores[z]+=.45*long_z[z]
     ranked=sorted(ALL_ZODIACS,key=lambda z:(-scores.get(z,-1e9),z))
     one=ranked[0] if ranked else ""
     return one,meta
@@ -1342,28 +1498,51 @@ def _profile_score_on_recent(r, profile, samples=28):
     # Coverage is the main objective, but 4肖/一肖一码 matter too.
     return (.58*h24 + .17*hmain + .25*hz)/n
 
+def _light_profile_calibration(r):
+    """Very small calibration pass. Never blocks the web/model rebuild path."""
+    if not r or background_state.get("profile_calibrating"):
+        return
+    background_state["profile_calibrating"]=True
+    try:
+        # Limit history and validation depth aggressively for free-tier CPU.
+        rr=r[:700]
+        scores={name:_profile_score_on_recent(rr,name,1) for name in PROFILE_LIBRARY}
+        best=max(scores,key=lambda k:(scores[k],k))
+        model_state["profile"]=best
+        model_state["profile_scores"]={k:round(v*100,1) for k,v in scores.items()}
+        model_state["last_calibrated_issue"]=r[0]["issue"] if r else None
+        print(f"[CAL] lightweight profile={best} scores={model_state['profile_scores']}",flush=True)
+    except Exception as e:
+        print(f"[CAL] failed: {type(e).__name__}: {e}",flush=True)
+    finally:
+        background_state["profile_calibrating"]=False
+
 def _select_profile(r, force=False):
-    latest_issue = r[0]["issue"] if r else None
-    cached = model_state.get("profile")
-    last = model_state.get("last_calibrated_issue")
+    """Return immediately. Heavy historical profile selection never blocks a page request."""
+    latest_issue=r[0]["issue"] if r else None
+    cached=model_state.get("profile") or "平衡"
+    last=model_state.get("last_calibrated_issue")
 
-    # Recalibrate every 12 issues or when no cached profile exists.
-    should_recalibrate = force or not cached or not last
-    if not should_recalibrate and latest_issue and last:
+    due=force or not last
+    if not due and latest_issue and last:
         try:
-            should_recalibrate = abs(int(latest_issue) - int(last)) >= 12
+            due=abs(int(latest_issue)-int(last)) >= 12
         except Exception:
-            should_recalibrate = False
+            due=False
 
-    if not should_recalibrate:
-        return cached, dict(model_state.get("profile_scores") or {})
+    if due and not background_state.get("profile_calibrating"):
+        threading.Thread(
+            target=_light_profile_calibration,
+            args=(list(r),),
+            daemon=True,
+            name="profile-calibration"
+        ).start()
 
-    scores={name:_profile_score_on_recent(r,name,20) for name in PROFILE_LIBRARY}
-    best=max(scores,key=lambda k:(scores[k],k))
-    model_state["profile"]=best
-    model_state["profile_scores"]={k:round(v*100,1) for k,v in scores.items()}
-    model_state["last_calibrated_issue"]=latest_issue
-    return best, dict(model_state["profile_scores"])
+    # First request/deploy uses balanced weights immediately.
+    if not model_state.get("profile"):
+        model_state["profile"]="平衡"
+        model_state["profile_scores"]={"平衡":0.0}
+    return model_state["profile"], dict(model_state.get("profile_scores") or {})
 
 def predict_core(r, profile=None):
     if not r:return [],[],[]
@@ -1416,9 +1595,50 @@ def backtest_stats(r, sample=60):
     stats_cache["value"]=val
     return val
 
+def initialize_quick_live_cache():
+    """Populate latest draw immediately without loading the full database."""
+    try:
+        r=recent_rows(1)
+        if not r:
+            return
+        latest=r[0]
+        latest_numbers=[latest[f"n{i}"] for i in range(1,7)]+[latest["special"]]
+        try:
+            next_issue=str(int(latest["issue"])+1)
+        except Exception:
+            next_issue=""
+        data={
+          "issue":latest["issue"],"next_issue":next_issue,"count":history_cache.get("total",0),
+          "latest_numbers":latest_numbers,
+          "latest_special_zodiac":normalize_z(latest["z7"] or ""),
+          "latest_created_at":latest["created_at"] or "",
+          "special24":[],"main4":[],"zodiac4":[],"zodiac_pairs":[],
+          "pingte_yixiao":"",
+          "pingte_samples":0,
+          "profile":model_state.get("profile") or "平衡",
+          "profile_scores":{},
+          "forecast":{"target_issue":next_issue,"transition_samples":0,
+                      "exact_previous_number_samples":0,
+                      "mode":"模型后台初始化中"},
+          "strategy":{"cold_rebound_now":False,"cold_zodiacs":[],
+                      "latest_zodiac":normalize_z(latest["z7"] or ""),
+                      "nmy_samples":0,"nmy_conditional_pct":0.0,"nmy_baseline_pct":0.0,
+                      "nmy_lift_pct":0.0,"head_advice":"模型后台初始化中","head_strength":{}},
+          "trend":{"wave":{},"size":{},"parity":{}},
+          "telegram":bool(BOT_TOKEN),
+          "recalculating":True
+        }
+        with live_cache_lock:
+            live_cache["issue"]=latest["issue"]
+            live_cache["data"]=data
+            live_cache["building"]=False
+        print(f"[BOOT] quick cache ready issue={latest['issue']}",flush=True)
+    except Exception as e:
+        print(f"[BOOT] quick cache failed: {type(e).__name__}: {e}",flush=True)
+
 def build_model():
     model_state["recalc_started_at"]=time.strftime("%Y-%m-%d %H:%M:%S")
-    r=all_rows()
+    r=recent_rows(1200)
     if not r:
         return {"issue":None,"count":0,"special24":[],"main4":[],"zodiac4":[],"zodiac_pairs":[],"telegram":bool(BOT_TOKEN),"recalculating":False}
     profile,profile_scores=_select_profile(r)
@@ -1432,7 +1652,7 @@ def build_model():
     try: next_issue=str(int(latest["issue"])+1)
     except Exception: next_issue=""
     return {
-      "issue":latest["issue"],"next_issue":next_issue,"count":len(r),
+      "issue":latest["issue"],"next_issue":next_issue,"count":history_cache.get("total",0),
       "latest_numbers":latest_numbers,
       "latest_special_zodiac":normalize_z(latest["z7"] or ""),
       "latest_created_at":latest["created_at"] or "",
@@ -1448,7 +1668,9 @@ def build_model():
         "target_issue":next_issue,
         "transition_samples":transition_meta.get("samples",0),
         "exact_previous_number_samples":transition_meta.get("exact_samples",0),
-        "mode":"集成前瞻：转移 + 遗漏风险 + 尾数 + 结构"
+        "long_prior_ready":bool(long_prior.get("ready")),
+        "long_prior_rows":int(long_prior.get("total",0)),
+        "mode":"极速混合：近1200期实时 + 全历史先验缓存"
       },
       "strategy":{
         "cold_rebound_now":strategy["cold_rebound_now"],
@@ -1515,7 +1737,13 @@ def home():
 def health():
     with history_cache_lock:
         count=history_cache.get("total",0)
-    return jsonify({"ok":True,"db":DB,"sqlite_mode":"WAL","telegram":bool(BOT_TOKEN),"telegram_mode":"webhook","webhook_base":WEBHOOK_BASE_URL,"count":count})
+    return jsonify({"ok":True,"ready":background_state.get("boot_ready",False),
+                    "model_building":bool(live_cache.get("building")),
+                    "stats_building":background_state.get("stats_building",False),
+                    "long_prior_ready":bool(long_prior.get("ready")),
+                    "long_prior_rows":int(long_prior.get("total",0)),
+                    "db":DB,"sqlite_mode":"WAL","telegram":bool(BOT_TOKEN),
+                    "telegram_mode":"webhook","webhook_base":WEBHOOK_BASE_URL,"count":count})
 
 @app.get("/api/prediction")
 def prediction():
@@ -1524,9 +1752,32 @@ def prediction():
     resp.headers["Cache-Control"]="no-store, no-cache, must-revalidate, max-age=0"
     return resp
 
+def _build_stats_background():
+    if background_state.get("stats_building"):
+        return
+    background_state["stats_building"]=True
+    try:
+        r=recent_rows(900)
+        # Keep this modest on the free instance. It is background diagnostics,
+        # never allowed to block the web page.
+        val=backtest_stats(r,6)
+        print(f"[STATS] refreshed n={val.get('n')} issue={r[0]['issue'] if r else None}",flush=True)
+    except Exception as e:
+        print(f"[STATS] failed: {type(e).__name__}: {e}",flush=True)
+    finally:
+        background_state["stats_building"]=False
+
 @app.get("/api/stats")
 def stats_api():
-    return jsonify(backtest_stats(all_rows(),60))
+    # Never run a historical backtest inside an HTTP request.
+    val=stats_cache.get("value")
+    if val is None:
+        val={"n":0,"hit24":0.0,"err24":0.0,"hitMain":0.0,"errMain":0.0,
+             "hitZ":0.0,"errZ":0.0,"hitPingte":0.0,"errPingte":0.0,
+             "profile":model_state.get("profile") or "平衡","building":True}
+        if not background_state.get("stats_building"):
+            threading.Thread(target=_build_stats_background,daemon=True,name="stats-builder").start()
+    return jsonify(val)
 
 @app.get("/api/history")
 def history():
@@ -1703,15 +1954,24 @@ def boot():
     init_db()
     import_history_once()
 
-    # IMPORTANT: pull the bot-collected history from the currently-live old service
-    # before this new version becomes the active deployment.
+    # Preserve latest bot-collected history before takeover.
     sync_best_available_history()
 
-    # Build once; page refreshes then read memory only.
-    refresh_all_caches()
+    # Make the site usable immediately. Do NOT wait for model/backtest here.
+    try:
+        refresh_history_cache()
+    except Exception as e:
+        print(f"[BOOT] history cache failed: {type(e).__name__}: {e}",flush=True)
+    initialize_quick_live_cache()
+    background_state["boot_ready"]=True
 
+    # Webhook can now receive new draws.
     if BOT_TOKEN:
         threading.Thread(target=webhook_keeper,daemon=True,name="telegram-webhook-keeper").start()
+
+    # Live model first, then full-history prior in parallel. Neither blocks the site.
+    threading.Thread(target=rebuild_live_cache,daemon=True,name="initial-model-build").start()
+    threading.Thread(target=build_long_prior,daemon=True,name="full-history-prior").start()
 
 boot()
 
