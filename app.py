@@ -102,6 +102,20 @@ auto_state = {
     "updating": False
 }
 
+fusion_lock = threading.RLock()
+fusion_cache = {
+    "mix_pct": 35.0,
+    "ai_rate60": 0.0,
+    "stat_rate60": 0.0,
+    "ai_rate12": 0.0,
+    "stat_rate12": 0.0,
+    "samples": 0,
+    "benchmark_profile": "平衡",
+    "advantage_pct": 0.0,
+    "reason": "实盘样本不足，使用35%保守融合",
+    "updated_at": ""
+}
+
 
 RED_NUMS = {1,2,7,8,12,13,18,19,23,24,29,30,34,35,40,45,46}
 BLUE_NUMS = {3,4,9,10,14,15,20,25,26,31,36,37,41,42,47,48}
@@ -389,8 +403,9 @@ async function loadMain(){
     const lr=d.learning||{};
     const ail=lr.ai_live||{};
     const au=lr.auto||{};
-    learningState.innerHTML=`AI滚动训练 ${lr.ai_rolling_trained??0}/100期 · 融合 ${lr.ai_mix_pct??0}%<br>实盘24码 ${ail.hit24??0}% (${ail.n??0}/60)`;
-    learningProgress.innerHTML=`100期重训 ${lr.ai_refit_count??0} 次 · 上次 ${lr.ai_refit_seconds??0}s<br>${au.updating?'正在扫描100期训练':'训练完成'} · 下一期 ${au.last_prediction_issue||d.next_issue||'--'}`;
+    const fu=lr.fusion||{};
+    learningState.innerHTML=`AI滚动训练 ${lr.ai_rolling_trained??0}/100期 · 动态融合 ${lr.ai_mix_pct??0}%<br>AI实盘 ${fu.ai_rate60??ail.hit24??0}% · 对比${fu.benchmark_profile||'统计'} ${fu.stat_rate60??0}%`;
+    learningProgress.innerHTML=`${fu.reason||'动态评估中'}<br>最近12期 AI ${fu.ai_rate12??0}% / 对比 ${fu.stat_rate12??0}%`;
     const sg=d.strategy||{};
     coldSignal.innerHTML=sg.cold_rebound_now?'冷反弹信号：启用<br>24码允许热+冷防守':'冷反弹信号：普通<br>仍以热码为主';
     coldZodiac.innerHTML=(sg.cold_zodiacs||[]).length?`偏冷：${sg.cold_zodiacs.join('、')}`:'暂无';
@@ -428,8 +443,9 @@ async function loadAutoStatus(){
     const r=await fetch('/api/auto-status?_='+Date.now(),{cache:'no-store'});
     const a=await r.json();
     const n=a.ai_live||{};
-    learningState.innerHTML=`AI滚动训练 ${a.ai_rolling_trained??0}/100期 · 融合 ${a.ai_mix_pct??0}%<br>实盘24码 ${n.hit24??0}% (${n.n??0}/60)`;
-    learningProgress.innerHTML=`100期重训 ${a.ai_refit_count??0} 次 · 上次 ${a.ai_refit_seconds??0}s<br>${a.updating?'正在扫描100期训练':'训练完成'} · 下一期 ${a.last_prediction_issue||'--'}`;
+    const f=a.fusion||{};
+    learningState.innerHTML=`AI滚动训练 ${a.ai_rolling_trained??0}/100期 · 动态融合 ${a.ai_mix_pct??0}%<br>AI实盘 ${f.ai_rate60??n.hit24??0}% · 对比${f.benchmark_profile||'统计'} ${f.stat_rate60??0}%`;
+    learningProgress.innerHTML=`${f.reason||'动态评估中'}<br>最近12期 AI ${f.ai_rate12??0}% / 对比 ${f.stat_rate12??0}%`;
   }catch(e){}
 }
 async function loadHistory(){
@@ -1838,6 +1854,104 @@ def train_ai_after_new_draw(issue, nums):
     retrain_ai_rolling_100(str(issue))
 
 
+
+def _rate_for_profile(profile, window):
+    with db_lock:
+        c=connect()
+        try:
+            rows=c.execute("""SELECT hit24
+                              FROM prediction_log
+                              WHERE profile=? AND settled=1
+                              ORDER BY CAST(target_issue AS INTEGER) DESC
+                              LIMIT ?""",(profile,int(window))).fetchall()
+        finally:
+            c.close()
+    n=len(rows)
+    h=sum(int(x["hit24"] or 0) for x in rows)
+    return n,h,(100.0*h/n if n else 0.0)
+
+def refresh_dynamic_ai_mix():
+    """Automatically raise/lower AI influence from real locked forward results.
+
+    Range:
+      20% minimum
+      70% maximum
+
+    It compares AI在线 against the strongest non-AI profile on the same
+    rolling history. 60-period performance is the main signal; the last 12
+    periods provide a smaller fast-reaction signal.
+    """
+    profiles=list(PROFILE_LIBRARY.keys())
+
+    ai_n60,ai_h60,ai_raw60=_rate_for_profile("AI在线",60)
+    ai_n12,ai_h12,ai_raw12=_rate_for_profile("AI在线",12)
+
+    stat_candidates=[]
+    for p in profiles:
+        n60,h60,r60=_rate_for_profile(p,60)
+        n12,h12,r12=_rate_for_profile(p,12)
+
+        # Bayesian smoothing toward the structural 24/49 coverage baseline.
+        base=24/49
+        sm60=(h60 + 4*base)/(n60+4) if n60>=0 else base
+        sm12=(h12 + 4*base)/(n12+4) if n12>=0 else base
+        combined=.72*sm60 + .28*sm12
+        stat_candidates.append((combined,p,n60,h60,r60,n12,h12,r12,sm60,sm12))
+
+    best=max(stat_candidates,key=lambda x:(x[0],x[1])) if stat_candidates else (24/49,"平衡",0,0,0,0,0,0,24/49,24/49)
+    _combined,best_p,st_n60,st_h60,st_raw60,st_n12,st_h12,st_raw12,st_sm60,st_sm12=best
+
+    base=24/49
+    ai_sm60=(ai_h60 + 4*base)/(ai_n60+4) if ai_n60>=0 else base
+    ai_sm12=(ai_h12 + 4*base)/(ai_n12+4) if ai_n12>=0 else base
+
+    # 60-period evidence dominates; 12-period result makes it respond faster.
+    advantage=.72*(ai_sm60-st_sm60) + .28*(ai_sm12-st_sm12)
+
+    # Confidence grows with real pre-draw AI samples.
+    confidence=min(1.0,ai_n60/60.0)
+
+    # Neutral center is 40%. A 10 percentage-point confirmed advantage is worth
+    # roughly +18 blend points once the 60-period window is mature.
+    mix=40.0 + 180.0*advantage*confidence
+
+    # With very little real data, do not let the value swing wildly.
+    if ai_n60 < 5:
+        mix=35.0
+        reason="实盘不足5期，AI融合固定35%"
+    else:
+        mix=max(20.0,min(70.0,mix))
+        adv_pct=advantage*100
+        if adv_pct >= 2.0:
+            reason=f"AI近期优于{best_p}，自动提高融合"
+        elif adv_pct <= -2.0:
+            reason=f"AI近期弱于{best_p}，自动降低融合"
+        else:
+            reason=f"AI与{best_p}接近，保持中等融合"
+
+    with fusion_lock:
+        fusion_cache.update({
+            "mix_pct":round(mix,1),
+            "ai_rate60":round(ai_raw60,1),
+            "stat_rate60":round(st_raw60,1),
+            "ai_rate12":round(ai_raw12,1),
+            "stat_rate12":round(st_raw12,1),
+            "samples":ai_n60,
+            "benchmark_profile":best_p,
+            "advantage_pct":round(advantage*100,2),
+            "reason":reason,
+            "updated_at":time.strftime("%Y-%m-%d %H:%M:%S")
+        })
+    return dict(fusion_cache)
+
+def get_dynamic_ai_mix():
+    with fusion_lock:
+        cached=dict(fusion_cache)
+    # Keep this cheap, but refresh if cache is empty/stale after a new issue.
+    if not cached.get("updated_at"):
+        return refresh_dynamic_ai_mix()
+    return cached
+
 def _candidate24_by_zodiac(r, profile):
     """Exactly 24 = 12 zodiacs × 2 codes.
     Hybrid ranking: statistical forecast + stabilized zodiac pair history + online AI."""
@@ -1852,10 +1966,8 @@ def _candidate24_by_zodiac(r, profile):
     if ai_ready:
         _X,_lg,ai_probs=_ai_logits_and_probs(r)
         ai_norm=_normalize_ai_probs(ai_probs)
-        with ai_lock:
-            rolling_trained=int(ai_state.get("rolling_trained",0))
-        maturity=min(1.0,rolling_trained/100.0)
-        ai_mix=0.20+0.30*maturity   # 20% early -> 50% with a full 100-period refit
+        fusion=get_dynamic_ai_mix()
+        ai_mix=float(fusion.get("mix_pct",35.0))/100.0
     else:
         ai_norm={n:.5 for n in range(1,50)}
         ai_mix=0.0
@@ -2121,6 +2233,10 @@ def settle_predictions(issue, nums, zs):
 
     if rows:
         best,_=refresh_learner_cache(60)
+        try:
+            refresh_dynamic_ai_mix()
+        except Exception as e:
+            print(f"[FUSION] refresh failed: {e}",flush=True)
         print(f"[LEARN] settled issue={issue} models={len(rows)} best={best}",flush=True)
 
 def record_shadow_predictions(r):
@@ -2503,10 +2619,8 @@ def build_model():
         "ai_rolling_trained":ai_state.get("rolling_trained",0),
         "ai_refit_count":ai_state.get("refit_count",0),
         "ai_refit_seconds":ai_state.get("last_refit_seconds",0.0),
-        "ai_mix_pct":(
-            round((0.20+0.30*min(1.0,float(ai_state.get("rolling_trained",0))/100.0))*100,1)
-            if ai_state.get("ready",False) else 0.0
-        ),
+        "ai_mix_pct":(get_dynamic_ai_mix().get("mix_pct",35.0) if ai_state.get("ready",False) else 0.0),
+        "fusion":get_dynamic_ai_mix(),
         "ai_history_n":ai_state.get("historical_validation_n",0),
         "ai_history_hit24":ai_state.get("historical_hit24",0.0),
         "ai_live":ai_live_validation_stats(60),
@@ -2668,7 +2782,8 @@ def auto_status():
     live=ai_live_validation_stats(60)
     trained=int(ai_state.get("trained",0))
     rolling_trained=int(ai_state.get("rolling_trained",0))
-    mix=round((0.20+0.30*min(1.0,rolling_trained/100.0))*100,1) if ai_state.get("ready",False) else 0.0
+    fusion=get_dynamic_ai_mix()
+    mix=float(fusion.get("mix_pct",35.0)) if ai_state.get("ready",False) else 0.0
     return jsonify({
       "ok":True,
       "updating":bool(auto_state.get("updating",False)),
@@ -2683,6 +2798,7 @@ def auto_status():
       "ai_refit_count":int(ai_state.get("refit_count",0)),
       "ai_refit_seconds":float(ai_state.get("last_refit_seconds",0.0)),
       "ai_mix_pct":mix,
+      "fusion":fusion,
       "ai_live":live,
       "model_settled":settled,
       "model_best":best,
@@ -2871,6 +2987,10 @@ def boot():
     sync_previous_learning()
     load_ai_state()
     refresh_learner_cache(60)
+    try:
+        refresh_dynamic_ai_mix()
+    except Exception as e:
+        print(f"[FUSION] boot refresh failed: {e}",flush=True)
     try:
         _r0=recent_rows(1)
         if _r0:
