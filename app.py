@@ -113,7 +113,7 @@ box-shadow:0 12px 30px #0007;opacity:0;pointer-events:none;transition:.2s;z-inde
 .trendBox{background:#0c1421;border:1px solid #1f2d43;border-radius:14px;padding:10px}
 .trendTitle{font-size:10px;color:#8f9cb0;margin-bottom:6px}
 .trendMain{font-size:13px;font-weight:850;line-height:1.55}
-.stats{display:grid;grid-template-columns:repeat(3,1fr);gap:8px}
+.stats{display:grid;grid-template-columns:repeat(2,1fr);gap:8px}
 .stat{background:#0c1421;border:1px solid #1d2a40;border-radius:16px;padding:12px}
 .statName{font-size:11px;color:#9ca8bb}.rate{font-size:22px;font-weight:900;margin-top:6px}.err{font-size:11px;color:#ff8492;margin-top:4px}
 .historyCard{padding-bottom:10px}
@@ -205,6 +205,17 @@ box-shadow:0 12px 30px #0007;opacity:0;pointer-events:none;transition:.2s;z-inde
 
   <section class="card">
     <div class="sectionHead">
+      <div class="sectionTitle">平特一肖</div>
+      <div class="sectionHint">预测下一期7个号码中至少出现1次的生肖</div>
+    </div>
+    <div class="comboBox" style="text-align:center">
+      <div id="pingteOne" style="font-size:36px;font-weight:900;letter-spacing:2px">--</div>
+      <div id="pingteSamples" class="sectionHint" style="margin-top:8px">--</div>
+    </div>
+  </section>
+
+  <section class="card">
+    <div class="sectionHead">
       <div class="sectionTitle">走势指数</div>
       <div class="sectionHint">波色 / 大小 / 单双</div>
     </div>
@@ -247,6 +258,7 @@ box-shadow:0 12px 30px #0007;opacity:0;pointer-events:none;transition:.2s;z-inde
       <div class="stat"><div class="statName">24码</div><div id="hit22" class="rate">--</div><div id="err22" class="err"></div></div>
       <div class="stat"><div class="statName">4肖1码</div><div id="hit4" class="rate">--</div><div id="err4" class="err"></div></div>
       <div class="stat"><div class="statName">4肖</div><div id="hitZ" class="rate">--</div><div id="errZ" class="err"></div></div>
+      <div class="stat"><div class="statName">平特一肖</div><div id="hitPingte" class="rate">--</div><div id="errPingte" class="err"></div></div>
     </div>
   </section>
 
@@ -259,7 +271,7 @@ box-shadow:0 12px 30px #0007;opacity:0;pointer-events:none;transition:.2s;z-inde
   </section>
 
   <div id="toast" class="toast">已复制</div>
-  <div class="foot">号码颜色按红 / 蓝 / 绿波显示。新版把波色、生肖、大小、单双作为近期统计特征参与动态评分；预测使用“当前状态→历史下一期结果”的一阶转移模型，并刻意减少刚开奖号对下一期的直接追涨。冷热、头数等只作辅助特征；命中率不代表未来中奖概率。</div>
+  <div class="foot">号码颜色按红 / 蓝 / 绿波显示。新版把波色、生肖、大小、单双作为近期统计特征参与动态评分；特码使用集成前瞻模型：状态转移、遗漏风险、尾数转移、波色/大小/单双/头数共同评分；平特一肖预测的是下一期7个号码里至少出现一次的生肖。所有命中率均为历史滚动验证，不代表未来概率。</div>
 </div>
 
 <script>
@@ -298,6 +310,8 @@ async function loadMain(){
       <div class="zpairName">${p.zodiac}</div>
       <div class="zpairCodes"><span class="microball ${cls(p.code)}">${p.code}</span></div>
     </div>`).join('');
+    pingteOne.textContent=d.pingte_yixiao||'--';
+    pingteSamples.textContent=`转移样本 ${d.pingte_samples??0}`;
     const tr=d.trend||{};
     const w=tr.wave||{}, sz=tr.size||{}, pa=tr.parity||{};
     waveTrend.innerHTML=`红 ${w['红']??0}%<br>蓝 ${w['蓝']??0}%<br>绿 ${w['绿']??0}%`;
@@ -329,6 +343,7 @@ async function loadStats(){
     hit22.textContent=(st.hit24??0).toFixed(1)+'%'; err22.textContent='错误 '+(st.err24??0).toFixed(1)+'%';
     hit4.textContent=(st.hitMain??0).toFixed(1)+'%'; err4.textContent='错误 '+(st.errMain??0).toFixed(1)+'%';
     hitZ.textContent=(st.hitZ??0).toFixed(1)+'%'; errZ.textContent='错误 '+(st.errZ??0).toFixed(1)+'%';
+    hitPingte.textContent=(st.hitPingte??0).toFixed(1)+'%'; errPingte.textContent='错误 '+(st.errPingte??0).toFixed(1)+'%';
   }catch(e){}
 }
 async function loadHistory(){
@@ -711,6 +726,14 @@ PROFILE_LIBRARY = {
   "均衡覆盖":{"recent":.82,"accel":.82,"wave":1.10,"size":1.10,"parity":1.10,"zodiac":1.40,"long":1.10,"omit":.90}
 }
 
+FORECAST_BLEND = {
+  "趋势快": {"transition":2.55,"hazard":.55,"tail":.50,"anti_chase":.72},
+  "平衡": {"transition":2.20,"hazard":.75,"tail":.58,"anti_chase":.65},
+  "热码": {"transition":1.85,"hazard":.42,"tail":.42,"anti_chase":.52},
+  "结构": {"transition":2.35,"hazard":.68,"tail":.72,"anti_chase":.68},
+  "均衡覆盖": {"transition":2.05,"hazard":1.05,"tail":.55,"anti_chase":.60}
+}
+
 def _zodiac_scores_profile(r, profile):
     p=PROFILE_LIBRARY[profile]
     score=defaultdict(float)
@@ -940,6 +963,8 @@ def _forward_transition_scores(r):
     cur_wave=wave_of(cur_n)
     cur_size=size_of(cur_n)
     cur_parity=parity_of(cur_n)
+    cur_tail=cur_n % 10
+    cur_zset={normalize_z(cur[f"z{k}"] or "") for k in range(1,8) if cur[f"z{k}"]}
 
     samples=0
     exact_samples=0
@@ -969,6 +994,15 @@ def _forward_transition_scores(r):
             match += .45
         if parity_of(pn)==cur_parity:
             match += .40
+        if pn % 10 == cur_tail:
+            match += .48
+
+        # Similarity of all 7 zodiacs in the state draw.
+        pzset={normalize_z(prev[f"z{k}"] or "") for k in range(1,8) if prev[f"z{k}"]}
+        if cur_zset and pzset:
+            inter=len(cur_zset & pzset)
+            union=max(1,len(cur_zset | pzset))
+            match += .70*(inter/union)
 
         # Two-step context: previous zodiac/head sequence when available.
         if j+1 < len(r):
@@ -1037,37 +1071,106 @@ def _base_hot_score_without_latest(r, profile):
         score[n] += .16*p["parity"]*trend["parity"].get(parity_of(n),0)
     return score
 
+def _gap_hazard_profile(r):
+    """Empirical gap hazard from special-number intervals.
+    This asks: after a number has been absent about g periods, how often did a
+    number historically appear on the next period? It is a statistical modifier,
+    not a guarantee that overdue numbers are 'due'."""
+    if len(r) < 300:
+        return {n:0.5 for n in range(1,50)}
+
+    seq=[x["special"] for x in reversed(r)]  # oldest -> newest
+    last={}
+    intervals=[]
+    for t,n in enumerate(seq):
+        if n in last:
+            intervals.append(t-last[n])
+        last[n]=t
+
+    # Hazard by gap bucket using completed intervals.
+    buckets=[(0,2),(3,5),(6,9),(10,14),(15,21),(22,35),(36,9999)]
+    hazard={}
+    for lo,hi in buckets:
+        at_risk=sum(1 for d in intervals if d>lo)
+        events=sum(1 for d in intervals if lo < d <= hi)
+        hazard[(lo,hi)]=(events/at_risk) if at_risk else 0.0
+
+    # Current omission gaps.
+    gaps={n:len(seq) for n in range(1,50)}
+    for i,x in enumerate(r):
+        n=x["special"]
+        if gaps[n]==len(seq):
+            gaps[n]=i
+
+    raw={}
+    for n,g in gaps.items():
+        val=0.0
+        for (lo,hi),h in hazard.items():
+            if lo <= g <= hi:
+                val=h
+                break
+        raw[n]=val
+
+    vals=list(raw.values())
+    lo=min(vals); hi=max(vals)
+    if hi-lo < 1e-9:
+        return {n:0.5 for n in raw}
+    return {n:(v-lo)/(hi-lo) for n,v in raw.items()}
+
+def _tail_transition_score(r):
+    """Current special tail -> next special number empirical transition."""
+    out=defaultdict(float)
+    if len(r)<80:
+        return out
+    cur_tail=r[0]["special"] % 10
+    for j in range(1,min(len(r)-1,1600)):
+        state=r[j]["special"]
+        nxt=r[j-1]["special"]
+        if state % 10 == cur_tail:
+            out[nxt]+=exp_weight(j,260)
+    if not out:
+        return out
+    vals=list(out.values()); lo=min(vals); hi=max(vals)
+    if hi-lo<1e-9:
+        return defaultdict(float,{k:.5 for k in out})
+    return defaultdict(float,{k:(v-lo)/(hi-lo) for k,v in out.items()})
+
 def _predictive_number_scores(r, profile, ctx=None):
-    """Forecast score for NEXT issue, not a mirror of the latest issue."""
+    """Forecast score for NEXT issue.
+    Ensemble: one-step transition + recent trend excluding latest + gap hazard
+    + tail transition + cold/head safeguards."""
     ctx=ctx or _strategy_context(r)
     score=_base_hot_score_without_latest(r,profile)
     num_t,z_t,head_t,wave_t,size_t,par_t,meta=_forward_transition_scores(r)
+    hazard=_gap_hazard_profile(r)
+    tail_t=_tail_transition_score(r)
+    blend=FORECAST_BLEND.get(profile,FORECAST_BLEND["平衡"])
 
     weak04=ctx["head"].get("active_04","")
     latest_n=r[0]["special"] if r else None
-    latest_z=normalize_z(r[0]["z7"] or "") if r else ""
 
     for n in range(1,50):
-        # Forward transition is the strongest incremental feature.
-        score[n] += 2.10*num_t[n]
-        score[n] += .75*head_t[head_of(n)]
-        score[n] += .62*wave_t[wave_of(n)]
-        score[n] += .52*size_t[size_of(n)]
-        score[n] += .48*par_t[parity_of(n)]
+        score[n] += blend["transition"]*num_t[n]
+        score[n] += .78*head_t[head_of(n)]
+        score[n] += .65*wave_t[wave_of(n)]
+        score[n] += .54*size_t[size_of(n)]
+        score[n] += .50*par_t[parity_of(n)]
+        score[n] += blend["hazard"]*hazard.get(n,.5)
+        score[n] += blend["tail"]*tail_t[n]
 
-        # Cold-defense logic remains evidence-based.
         cold=ctx["num_cold"].get(n,0)
-        score[n] += (0.85 if ctx["cold_rebound_now"] else 0.15)*cold
+        score[n] += (0.72 if ctx["cold_rebound_now"] else 0.10)*cold
 
-        # Weak-head signal is a downweight only.
         if weak04 and head_of(n)==weak04:
-            score[n] -= .70
+            score[n] -= .62
 
-        # Anti-chase cooldown: do not promote the number just because it opened.
-        # Repeats are still possible if transition history supports them.
+        # Repeat is not banned. We only remove the artificial "just opened = hot"
+        # effect; transition evidence may still put the same number back in.
         if latest_n is not None and n==latest_n:
-            score[n] -= .75
+            score[n] -= blend["anti_chase"]
 
+    meta=dict(meta)
+    meta["ensemble"]="转移+遗漏风险+尾数转移+结构"
     return score,meta,z_t
 
 def _candidate24_by_zodiac(r, profile):
@@ -1143,6 +1246,81 @@ def _predict_with_profile(r, profile):
     main4=[p["code"] for p in zpairs]
     return cand24,main4,z4,groups,zpairs
 
+def _draw_zodiac_set(x):
+    return {normalize_z(x[f"z{k}"] or "") for k in range(1,8) if x[f"z{k}"]}
+
+def _pingte_yixiao_scores(r):
+    """Predict one zodiac that will appear anywhere among the next draw's 7 numbers."""
+    score={z:0.0 for z in ALL_ZODIACS}
+    if not r:
+        return score,{"samples":0}
+
+    # Base presence trend. Binary per draw: a zodiac counts once even if repeated.
+    hist=r[1:] if len(r)>1 else r
+    for horizon,half,coef in [(8,3,1.80),(16,5,1.45),(36,11,1.00),(80,25,.62),(160,50,.35)]:
+        for i,x in enumerate(hist[:min(horizon,len(hist))]):
+            w=coef*exp_weight(i,half)
+            for z in _draw_zodiac_set(x):
+                if z in score:
+                    score[z]+=w
+
+    # Presence acceleration.
+    a=Counter()
+    b=Counter()
+    for x in hist[:8]:
+        for z in _draw_zodiac_set(x): a[z]+=1
+    for x in hist[8:32]:
+        for z in _draw_zodiac_set(x): b[z]+=1
+    for z in ALL_ZODIACS:
+        score[z]+=1.25*(a[z]/8.0-b[z]/24.0)
+
+    # Current-state -> next-draw zodiac-presence transition.
+    cur=r[0]
+    cur_special_z=normalize_z(cur["z7"] or "")
+    cur_set=_draw_zodiac_set(cur)
+    cur_head=head_of(cur["special"])
+    cur_wave=wave_of(cur["special"])
+    cur_size=size_of(cur["special"])
+    cur_parity=parity_of(cur["special"])
+
+    trans=defaultdict(float)
+    samples=0
+    for j in range(1,min(len(r)-1,1800)):
+        state=r[j]
+        outcome=r[j-1]
+        match=0.0
+        if normalize_z(state["z7"] or "")==cur_special_z: match+=1.70
+        if head_of(state["special"])==cur_head: match+=.62
+        if wave_of(state["special"])==cur_wave: match+=.48
+        if size_of(state["special"])==cur_size: match+=.38
+        if parity_of(state["special"])==cur_parity: match+=.34
+        stset=_draw_zodiac_set(state)
+        if cur_set and stset:
+            match+=.90*(len(cur_set & stset)/max(1,len(cur_set | stset)))
+        if match<=0: continue
+        samples+=1
+        ww=exp_weight(j,280)*match
+        for z in _draw_zodiac_set(outcome):
+            if z in score:
+                trans[z]+=ww
+
+    if trans:
+        vals=list(trans.values()); lo=min(vals); hi=max(vals)
+        if hi-lo>1e-9:
+            for z in ALL_ZODIACS:
+                score[z]+=1.85*((trans[z]-lo)/(hi-lo))
+        else:
+            for z in trans:
+                score[z]+=.90
+
+    return score,{"samples":samples}
+
+def _predict_pingte_yixiao(r):
+    scores,meta=_pingte_yixiao_scores(r)
+    ranked=sorted(ALL_ZODIACS,key=lambda z:(-scores.get(z,-1e9),z))
+    one=ranked[0] if ranked else ""
+    return one,meta
+
 def _profile_score_on_recent(r, profile, samples=28):
     if len(r)<260:
         return 0.0
@@ -1195,29 +1373,34 @@ def predict_core(r, profile=None):
 
 def backtest_stats(r, sample=60):
     if not r or len(r)<420:
-        return {"n":0,"hit24":0.0,"err24":100.0,"hitMain":0.0,"errMain":100.0,"hitZ":0.0,"errZ":100.0,"profile":"--"}
+        return {"n":0,"hit24":0.0,"err24":100.0,"hitMain":0.0,"errMain":100.0,
+                "hitZ":0.0,"errZ":100.0,"hitPingte":0.0,"errPingte":100.0,"profile":"--"}
     latest_issue=r[0]["issue"]
     if stats_cache["issue"]==latest_issue and stats_cache["value"] is not None:
         return stats_cache["value"]
 
     tests=min(sample,len(r)-320)
 
-    # Honest split: choose the model using data older than the validation window.
+    # Choose profile only from older data than the validation window.
     calibration_source=r[tests:]
     profile,_scores=_select_profile(calibration_source)
 
-    h24=hmain=hz=0
+    h24=hmain=hz=hping=0
     actual_tests=0
     for k in range(tests-1,-1,-1):
         train=r[k+1:]
         if len(train)<260: continue
         c24,m4,z4,_,_=_predict_with_profile(train,profile)
+        py,_=_predict_pingte_yixiao(train)
         actual=r[k]
         sp=actual["special"]
         az=normalize_z(actual["z7"] or "")
+        draw_z=_draw_zodiac_set(actual)
+
         h24+=int(sp in c24)
         hmain+=int(sp in m4)
         hz+=int(bool(az) and az in z4)
+        hping+=int(bool(py) and py in draw_z)
         actual_tests+=1
 
     n=max(actual_tests,1)
@@ -1226,7 +1409,8 @@ def backtest_stats(r, sample=60):
       "profile":profile,
       "hit24":round(h24/n*100,1),"err24":round((actual_tests-h24)/n*100,1),
       "hitMain":round(hmain/n*100,1),"errMain":round((actual_tests-hmain)/n*100,1),
-      "hitZ":round(hz/n*100,1),"errZ":round((actual_tests-hz)/n*100,1)
+      "hitZ":round(hz/n*100,1),"errZ":round((actual_tests-hz)/n*100,1),
+      "hitPingte":round(hping/n*100,1),"errPingte":round((actual_tests-hping)/n*100,1)
     }
     stats_cache["issue"]=latest_issue
     stats_cache["value"]=val
@@ -1239,6 +1423,7 @@ def build_model():
         return {"issue":None,"count":0,"special24":[],"main4":[],"zodiac4":[],"zodiac_pairs":[],"telegram":bool(BOT_TOKEN),"recalculating":False}
     profile,profile_scores=_select_profile(r)
     c24,m4,z4,groups,zpairs=_predict_with_profile(r,profile)
+    pingte_one,pingte_meta=_predict_pingte_yixiao(r)
     trend=_trend_profiles(r)
     strategy=_strategy_context(r)
     _nt,_zt,_ht,_wt,_st,_pt,transition_meta=_forward_transition_scores(r)
@@ -1255,13 +1440,15 @@ def build_model():
       "main4":[f"{n:02d}" for n in m4],
       "zodiac4":z4,
       "zodiac_pairs":[{"zodiac":p["zodiac"],"code":f"{p['code']:02d}"} for p in zpairs],
+      "pingte_yixiao":pingte_one,
+      "pingte_samples":pingte_meta.get("samples",0),
       "profile":profile,
       "profile_scores":profile_scores,
       "forecast":{
         "target_issue":next_issue,
         "transition_samples":transition_meta.get("samples",0),
         "exact_previous_number_samples":transition_meta.get("exact_samples",0),
-        "mode":"前瞻一阶转移 + 趋势（不追上期）"
+        "mode":"集成前瞻：转移 + 遗漏风险 + 尾数 + 结构"
       },
       "strategy":{
         "cold_rebound_now":strategy["cold_rebound_now"],
